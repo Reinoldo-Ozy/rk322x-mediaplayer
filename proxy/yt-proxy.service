@@ -1,0 +1,12 @@
+[Unit]
+Description=YouTube/Media Proxy for RK322x
+After=network.target
+
+[Service]
+User=reinoldo
+ExecStart=/usr/bin/python3 /home/reinoldo/yt_proxy.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

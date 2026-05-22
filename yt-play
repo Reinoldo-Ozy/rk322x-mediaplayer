@@ -1,0 +1,32 @@
+#!/bin/bash
+# Reproduz vídeo YouTube no box4 via HDMI usando hardware decode (rkvdec)
+# Requer HDMI conectado. Audio: hw:2 (HDMI) ou hw:0 (P2 analógico)
+#
+# Uso: yt-play VIDEO_ID [720|480|360] [analog]
+#   yt-play dQw4w9WgXcQ           -> 720p HDMI com áudio HDMI
+#   yt-play dQw4w9WgXcQ 480       -> 480p HDMI com áudio HDMI
+#   yt-play dQw4w9WgXcQ 720 analog -> áudio na saída analógica (P2)
+
+PC_PROXY="http://192.168.10.158:8091"
+VIDEO_ID="${1:-}"
+QUALITY="${2:-720}"
+AUDIO_OUT="${3:-hdmi}"
+
+if [ -z "$VIDEO_ID" ]; then
+    echo "Uso: yt-play VIDEO_ID [720|480|360] [analog]"
+    exit 1
+fi
+
+if [ "$AUDIO_OUT" = "analog" ]; then
+    AUDIO_DEVICE="hw:0"
+else
+    AUDIO_DEVICE="hw:2"
+fi
+
+killall gst-launch-1.0 2>/dev/null
+
+exec gst-launch-1.0 -e \
+  souphttpsrc location="${PC_PROXY}/play?v=${VIDEO_ID}&q=${QUALITY}&fmt=ts" automatic-redirect=true ! \
+  tsdemux name=demux \
+  demux. ! queue ! h264parse ! v4l2slh264dec ! videoconvert ! kmssink driver-name=rockchip sync=true \
+  demux. ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample ! "audio/x-raw,rate=44100,channels=2" ! alsasink device="${AUDIO_DEVICE}"
