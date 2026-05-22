@@ -3,8 +3,8 @@ Description=YouTube/Media Proxy for RK322x
 After=network.target
 
 [Service]
-User=reinoldo
-ExecStart=/usr/bin/python3 /home/reinoldo/yt_proxy.py
+User=USER_PLACEHOLDER
+ExecStart=PYTHON_PLACEHOLDER PROXY_PATH_PLACEHOLDER
 Restart=always
 RestartSec=5
 

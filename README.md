@@ -121,9 +121,12 @@ aplay -l
 ### 5. Install yt-play
 
 ```bash
-sudo cp yt-play /usr/local/bin/yt-play
-sudo chmod +x /usr/local/bin/yt-play
+git clone https://github.com/Reinoldo-Ozy/rk322x-mediaplayer
+cd rk322x-mediaplayer
+sudo ./install-box.sh PROXY_IP   # replace with your proxy machine IP
 ```
+
+The script installs GStreamer packages, copies `yt-play` to `/usr/local/bin/`, and saves the proxy IP to `/etc/profile.d/rk322x-proxy.sh`.
 
 ---
 
@@ -135,32 +138,15 @@ The proxy runs on **a separate machine** on the same network (a Raspberry Pi, an
 
 ### On the proxy machine
 
-Requirements: Python 3.11+, ffmpeg, Node.js, yt-dlp
-
 ```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt install -y ffmpeg nodejs python3
-
-pip3 install yt-dlp
-
-# Copy the proxy script
-cp proxy/yt_proxy.py /home/$USER/yt_proxy.py
-
-# Install the systemd service
-sudo cp proxy/yt-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now yt-proxy.service
+git clone https://github.com/Reinoldo-Ozy/rk322x-mediaplayer
+cd rk322x-mediaplayer
+sudo ./install-proxy.sh
 ```
 
-Edit `yt_proxy.py` and set `PORT` and optionally a cookies file path if you need authenticated YouTube access.
+The script installs ffmpeg, Node.js, yt-dlp, copies the proxy to `/opt/rk322x-proxy/`, and starts it as a systemd service on port 8091.
 
-### Configure yt-play on the RK322x box
-
-Edit `/usr/local/bin/yt-play` and set `PC_PROXY` to the proxy machine's IP:
-
-```bash
-PC_PROXY="http://192.168.1.XXX:8091"   # change to your proxy machine IP
-```
+To enable authenticated YouTube access (avoids some throttling), export cookies from your browser and set the `COOKIES` path in `/opt/rk322x-proxy/yt_proxy.py`.
 
 ---
 
@@ -229,10 +215,12 @@ yt-dlp takes 10–15 seconds to resolve YouTube URLs. During that time, GStreame
 ## Files in this repo
 
 ```
-├── yt-play          # Playback script — install on the RK322x box
+├── install-box.sh        # Installer for the RK322x box
+├── install-proxy.sh      # Installer for the proxy machine
+├── yt-play               # Playback script (installed by install-box.sh)
 └── proxy/
-    ├── yt_proxy.py  # Proxy server — runs on a separate machine
-    └── yt-proxy.service
+    ├── yt_proxy.py       # Proxy server (installed by install-proxy.sh)
+    └── yt-proxy.service  # systemd unit template
 ```
 
 ---

@@ -1,19 +1,26 @@
 #!/bin/bash
-# Reproduz vídeo YouTube no box4 via HDMI usando hardware decode (rkvdec)
-# Requer HDMI conectado. Audio: hw:2 (HDMI) ou hw:0 (P2 analógico)
+# Hardware H.264 playback via rkvdec + GStreamer
+# Requires HDMI connected. Audio: hw:2 (HDMI) or hw:0 (analog/3.5mm jack)
 #
-# Uso: yt-play VIDEO_ID [720|480|360] [analog]
-#   yt-play dQw4w9WgXcQ           -> 720p HDMI com áudio HDMI
-#   yt-play dQw4w9WgXcQ 480       -> 480p HDMI com áudio HDMI
-#   yt-play dQw4w9WgXcQ 720 analog -> áudio na saída analógica (P2)
+# Usage: yt-play VIDEO_ID [720|480|360] [analog]
+#   yt-play dQw4w9WgXcQ              -> 720p, HDMI audio
+#   yt-play dQw4w9WgXcQ 480          -> 480p, HDMI audio
+#   yt-play dQw4w9WgXcQ 720 analog   -> 720p, analog audio (3.5mm)
 
-PC_PROXY="http://192.168.10.158:8091"
+PROXY_IP="${RK_PROXY_IP:-}"
+PC_PROXY="http://${PROXY_IP}:8091"
 VIDEO_ID="${1:-}"
 QUALITY="${2:-720}"
 AUDIO_OUT="${3:-hdmi}"
 
 if [ -z "$VIDEO_ID" ]; then
-    echo "Uso: yt-play VIDEO_ID [720|480|360] [analog]"
+    echo "Usage: yt-play VIDEO_ID [720|480|360] [analog]"
+    exit 1
+fi
+
+if [ -z "$PROXY_IP" ]; then
+    echo "Error: proxy IP not configured."
+    echo "Set RK_PROXY_IP environment variable or run install-box.sh first."
     exit 1
 fi
 
@@ -29,4 +36,5 @@ exec gst-launch-1.0 -e \
   souphttpsrc location="${PC_PROXY}/play?v=${VIDEO_ID}&q=${QUALITY}&fmt=ts" automatic-redirect=true ! \
   tsdemux name=demux \
   demux. ! queue ! h264parse ! v4l2slh264dec ! videoconvert ! kmssink driver-name=rockchip sync=true \
-  demux. ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample ! "audio/x-raw,rate=44100,channels=2" ! alsasink device="${AUDIO_DEVICE}"
+  demux. ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample \
+  ! "audio/x-raw,rate=44100,channels=2" ! alsasink device="${AUDIO_DEVICE}"
