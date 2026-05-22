@@ -146,7 +146,30 @@ sudo ./install-proxy.sh
 
 The script installs ffmpeg, Node.js, yt-dlp, copies the proxy to `/opt/rk322x-proxy/`, and starts it as a systemd service on port 8091.
 
-To enable authenticated YouTube access (avoids some throttling), export cookies from your browser and set the `COOKIES` path in `/opt/rk322x-proxy/yt_proxy.py`.
+### YouTube cookies (optional but recommended)
+
+Without cookies, yt-dlp works anonymously. YouTube may throttle anonymous requests or block certain videos. Adding your browser cookies avoids most of these issues.
+
+**Step 1** — Install a browser extension to export cookies:
+- Chrome/Edge: [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+- Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+
+**Step 2** — Open YouTube while logged in, click the extension, and export `cookies.txt`.
+
+**Step 3** — Copy the file to the proxy machine:
+```bash
+scp cookies.txt user@proxy-machine:/opt/rk322x-proxy/cookies.txt
+```
+
+**Step 4** — Edit `/opt/rk322x-proxy/yt_proxy.py` and set:
+```python
+COOKIES = "/opt/rk322x-proxy/cookies.txt"
+```
+
+**Step 5** — Restart the proxy:
+```bash
+sudo systemctl restart yt-proxy
+```
 
 ---
 
