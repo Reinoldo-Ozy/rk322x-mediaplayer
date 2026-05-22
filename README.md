@@ -274,3 +274,11 @@ yt-dlp takes 10–15 seconds to resolve YouTube URLs. During that time, GStreame
 - [GStreamer V4L2 stateless codecs](https://gstreamer.freedesktop.org/documentation/v4l2codecs/)
 - [rkvdec kernel driver](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/media/platform/rockchip/rkvdec)
 - [Lima GPU driver (Mali-400)](https://docs.mesa3d.org/drivers/lima.html)
+
+---
+
+## AI assistance
+
+This project was developed with the assistance of [Claude](https://claude.ai) (Anthropic). The debugging sessions, GStreamer pipeline design, kernel driver research, and documentation were done collaboratively between the author and Claude Code.
+
+All code was tested on real hardware. The AI assisted in reasoning through kernel internals (V4L2 stateless API, Rockchip EPHY driver, DRM memory bandwidth constraints) and iterating on the GStreamer pipeline until it worked correctly on the actual device.
