@@ -1,0 +1,4 @@
+.obsidian/
+__pycache__/
+*.pyc
+.claude/
