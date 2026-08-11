@@ -1,4 +1,4 @@
-# Hardware H.264 Decode on RK322x — Mainline Kernel 6.6
+# Hardware H.264 Decode on RK322x — Mainline Kernel
 
 Hardware-accelerated **1080p60** H.264 video playback on Rockchip RK322x TV boxes using the mainline Linux kernel, GStreamer, and open-source drivers only. No Android, no proprietary blobs, no BSP kernel.
 
@@ -69,9 +69,14 @@ The RK322x hardware decoder (`rkvdec`) handles H.264 decode. The CPU only parses
 
 | Resolution | Decoder | Result |
 |---|---|---|
-| 720p@30fps H.264 | rkvdec (hardware) | ✅ Real-time, zero frame drops |
-| 1080p@30fps H.264 | rkvdec (hardware) | ❌ ~13fps — not real-time |
-| 1080p@30fps H.264 | avdec_h264 (software) | ❌ Real-time without display, drops frames with kmssink |
+| 1080p@60fps H.264 | rkvdec, zero-copy to kmssink | ✅ 60.02 fps, zero frame drops |
+| 1080p@30/25fps H.264 | rkvdec, zero-copy to kmssink | ✅ Zero frame drops |
+| 720p@60fps H.264 | rkvdec, zero-copy to kmssink | ✅ 60.00 fps, zero frame drops |
+| 1080p, decode throughput alone | rkvdec, no display | 231 fps — 4× what 60 fps needs |
+| 1080p, decoded then copied to RAM | rkvdec + copy | 10 fps — the copy costs ~90% |
+
+Earlier versions of this document reported ~13 fps at 1080p. That measurement used `fakesink`,
+which forces the copy shown in the last row. See [Full HD, corrected](#full-hd-corrected).
 
 **Superseded — 1080p60 works.** The reasoning above identified the right mechanism (copying
 decoded frames out of uncached VPU memory is brutally expensive on a Cortex-A7) but drew the
@@ -228,14 +233,19 @@ gst-launch-1.0 -e filesrc location=/path/to/video.mp4 ! qtdemux name=demux \
 |---|---|
 | Open a browser and watch YouTube | ❌ Browsers do software decode — unusable frame rate |
 | Install XFCE and use it like a PC | ❌ Desktop + browser overhead kills performance; no VA-API bridge for rkvdec |
-| Play 1080p video | ❌ Hardware limitation (DRM memory bandwidth) |
-| Use a remote control | ❌ Not implemented — use SSH or build a UI on top |
-| Works with any H.264 file | ⚠️ H.264 Main/High profile ≤720p only; HEVC and AV1 not supported by rkvdec on this SoC |
+| Play 1080p video | ✅ Works at 60 fps — see [Full HD, corrected](#full-hd-corrected) |
+| Use a remote control | ❌ Not implemented, but `/dev/cec0` and `/dev/lirc0` are exposed on the box |
+| Works with any H.264 file | ⚠️ H.264 Main/High profile up to 1080p; HEVC decodes but slower than H.264; AV1 not supported by rkvdec on this SoC |
 | Audio from any format | ⚠️ Only AAC tested; MP3/Opus needs different decoder element |
 
 **Why not install a desktop environment?**
 
-The Cortex-A7 at 1.2GHz cannot sustain the memory bandwidth needed for 1080p video through the DRM framebuffer. At 720p this works because the frame size (~1.4MB) fits within what the hardware can push. A desktop environment (XFCE, etc.) would run — but video in a browser or media player with a GUI adds overhead that puts even 720p at risk. If you want a GUI, consider a lightweight web interface that triggers `yt-play` via HTTP rather than running a full desktop.
+Not because of memory bandwidth — that explanation was wrong, and 1080p60 runs fine with a
+zero-copy pipeline. The real reason is that **a browser or GUI player cannot reach the VPU**:
+they fall back to software decode, and software decode of 1080p manages 27 fps on a desktop
+i5 — roughly 10× faster per core than this Cortex-A7. The performance here comes entirely from
+the manual `rkvdec → DMA-BUF → kmssink` path. If you want a UI, drive the box remotely (this
+repo ships a desktop app that does exactly that) rather than running one on it.
 
 **Why does the proxy need to be on a separate machine?**
 
