@@ -366,3 +366,32 @@ Beyond the pipeline fix, this repository now carries a working setup:
   time (written in Portuguese).
 
 The original `yt-play` and proxy tooling documented above still works and remains in the repo.
+
+---
+
+## Credits
+
+This work stands on the RK322x platform support built by others. Specifically:
+
+**[jock (paolosabatino)](https://forum.armbian.com/profile/9843-jock/)** — maintainer of the CSC
+Armbian rk322x boards. Three concrete things from his work were used here:
+
+- His **[v4l2request ffmpeg APT repository](https://forum.armbian.com/topic/32449-repository-for-v4l2request-hardware-video-decoding-rockchip-allwinner/)**
+  (`apt.undo.it`), an ffmpeg built with the v4l2request and v4l2drmprime patches. Installing it is
+  what proved the decoder was never the bottleneck — 102 fps at 1080p, 225 fps with memory
+  frequency scaling enabled. It is not in the final runtime path (the player uses GStreamer), but
+  it is what killed the "the hardware is too slow" hypothesis and redirected the whole
+  investigation.
+- His note that **Rockchip SoCs don't need large CMA buffers because the hardware decoders have
+  their own MMUs**. This corrected a wrong hypothesis: raising CMA from 16 MB to 128 MB had made
+  no difference, and his explanation said why.
+- His documented expectation for the rk3228 — roughly 1080p25/1080p30, and only outside a
+  compositor — which set the bar these tests were measured against. The final result went past it,
+  but knowing where the bar was is what made the anomaly worth chasing.
+
+**The Armbian rk322x community thread**
+([CSC Armbian for RK322x TV box boards](https://forum.armbian.com/topic/34923-csc-armbian-for-rk322x-tv-box-boards/))
+— for the platform itself, without which none of this exists.
+
+Also noted while researching, though not used here: **ilmich's** unofficial LibreELEC builds for
+RK3228/RK3229 and **Jonas Karlman's** rkvdec HEVC backend series upstreamed in August 2025.
