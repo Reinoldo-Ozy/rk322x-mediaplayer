@@ -93,7 +93,7 @@ proxy/  original yt-dlp proxy (still works, see below)
 | File | Purpose |
 |---|---|
 | `tv-cast-gui.py` | GTK4/libadwaita app: play a link on the TV, media controls, mirroring |
-| `tv-cast.py` | Mirroring: Wayland portal capture → VA-API encode → RTP |
+| `tv-cast.py` | Mirroring: Wayland portal capture → VA-API encode → RTP, audio of one window or of the system |
 | `tv-cast.desktop.in` | Application menu entry template |
 | `instalar.sh` | Generates the menu entry with the correct path for this checkout |
 | `portal-screencast.py` | Utility: request a PipeWire node from the portal (diagnostics) |
@@ -112,6 +112,44 @@ The box address defaults to `192.168.10.159`. Override it without editing any so
 echo 'TV_BOX_HOST=192.168.1.50' >> ~/.config/tv-cast.conf
 # or, per run:  TV_BOX_HOST=192.168.1.50 python3 pc/tv-cast-gui.py
 ```
+
+#### Sending only one window's audio
+
+Mirroring a single window used to send the whole system mix with it — notifications, calls and
+every other tab leaked onto the TV. Mirroring a window now sends **only the audio of the program
+that owns it** (`--audio-source janela`, the default in the GUI for window capture;
+`--audio-source sistema` restores the old behaviour, and `--audio-pid N` picks a process by hand).
+
+Two problems had to be solved.
+
+**Which window was picked?** The portal will not say. The `Start` response carries only `size`,
+`position` and `source_type`, and the PipeWire node is anonymous — `node.name` is always
+`xdg-desktop-portal-hyprland`, confirmed with `pw-dump`. The owner is therefore found by matching
+the size the portal reports against the compositor's window list (`hyprctl clients -j`). A size
+tie is broken by whichever candidate is playing audio; if that is still ambiguous, it says so and
+falls back to system audio. This part is Hyprland-specific — another compositor needs its own
+window query.
+
+**How to capture one program without muting it locally.** A null sink is created and the
+program's output ports are linked into it with `pw-link`, *in addition to* the links it already
+has to the speakers — never moving the stream. Local playback is untouched; the null sink's
+monitor contains that program and nothing else.
+
+```
+program ──┬─→ speakers            (its original link, left alone)
+          └─→ tvcast_<pid> ──monitor──→ ffmpeg ──RTP L16──→ box
+```
+
+Capturing the program's node directly would have been simpler and wrong: applications destroy and
+recreate their audio node constantly (changing video in a browser is enough), and the capture
+would die with it. The null sink is the stable end of the chain — it keeps delivering silence
+while the program is quiet, which keeps the RTP clock advancing (measured: 8.01 s of audio in
+8.20 s of wall clock with nothing playing). A thread re-links whatever appears, every 0.4 s for
+the first few seconds and every 1.5 s after that.
+
+Separation is **per process**: tabs and windows of the same browser share one audio process and
+cannot be told apart. Rejection measured against a 1 kHz tone played by another program: 88.9 in
+the system mix versus 0.60 in the isolated capture, ~43 dB.
 
 ### `box/` — the TV box
 

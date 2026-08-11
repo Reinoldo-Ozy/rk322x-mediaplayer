@@ -47,6 +47,9 @@ def token_de(origem):
 
 ORIGENS = [("Uma tela inteira", "monitor"), ("Apenas uma janela", "janela")]
 
+# So faz sentido com uma janela: numa tela inteira o som e sempre o do sistema.
+SONS = [("Só do programa da janela", "janela"), ("Tudo que sai no computador", "sistema")]
+
 # (rotulo, kbps) — taxas escolhidas por medicao de SSIM contra o original:
 #   8 Mbps -> ~0.985 | 20 Mbps -> 0.9983 | 30 Mbps -> 0.9994 (quase transparente)
 # O enlace da 95 Mbit/s e o box decodifica ate 40 Mbps a 60fps sem perder quadro.
@@ -212,9 +215,15 @@ class Janela(Adw.ApplicationWindow):
         self.combo.set_selected(PADRAO)
         g_esp.add(self.combo)
 
-        self.audio = Adw.SwitchRow(title="Enviar o som do computador")
+        self.audio = Adw.SwitchRow(title="Enviar o som")
         self.audio.set_active(True)
+        self.audio.connect("notify::active", self.ao_trocar_origem)
         g_esp.add(self.audio)
+
+        self.som = Adw.ComboRow(title="De onde vem o som")
+        self.som.set_model(Gtk.StringList.new([s[0] for s in SONS]))
+        self.som.connect("notify::selected", self.ao_trocar_origem)
+        g_esp.add(self.som)
         self.ao_trocar_origem()
 
         self.botao = Gtk.Button(label="Espelhar")
@@ -339,6 +348,11 @@ class Janela(Adw.ApplicationWindow):
         self.escolha.set_subtitle(f"Uma {alvo} já está memorizada"
                                   if os.path.exists(token_de(o))
                                   else f"Vai perguntar qual {alvo} usar")
+        self.som.set_visible(o == "janela" and self.audio.get_active())
+        self.som.set_subtitle(
+            "Abas de um mesmo navegador contam como um programa só"
+            if SONS[self.som.get_selected()][1] == "janela" else
+            "Inclui notificações, chamadas e qualquer outro programa")
 
     def alternar(self, _b):
         self.parar_espelho() if self.espelhando() else self.iniciar_espelho()
@@ -349,6 +363,8 @@ class Janela(Adw.ApplicationWindow):
                str(QUALIDADES[self.combo.get_selected()][1]), "--source", o]
         if not self.audio.get_active():
             cmd.append("--no-audio")
+        elif o == "janela":
+            cmd += ["--audio-source", SONS[self.som.get_selected()][1]]
         box_cmd(cmd="stop")   # libera a TV se estiver tocando algo
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,

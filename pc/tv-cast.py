@@ -6,7 +6,7 @@ transmite H.264 por RTP. Encoder por hardware na Arc (VAAPI).
 
 Uso:  tv-cast.py [--host IP] [--port N] [--width W] [--height H] [--fps N] [--bitrate K]
 """
-import argparse, os, random, signal, subprocess, sys
+import argparse, atexit, json, os, random, signal, subprocess, sys, threading
 from pathlib import Path
 import gi
 gi.require_version("Gio", "2.0")
@@ -31,6 +31,12 @@ ap.add_argument("--no-audio", action="store_true", help="nao transmitir o audio 
 ap.add_argument("--audio-port", type=int, default=0, help="porta do audio (padrao: video+2)")
 ap.add_argument("--source", choices=["monitor", "janela", "ambos"], default="monitor",
                 help="o que capturar: uma tela inteira, uma janela, ou deixar escolher")
+ap.add_argument("--audio-source", choices=["sistema", "janela"], default="sistema",
+                help="'sistema' manda tudo que sai das caixas; 'janela' manda so o som "
+                     "do programa dono da janela capturada")
+ap.add_argument("--audio-pid", type=int, default=0,
+                help="mandar so o som deste processo (e dos filhos dele); dispensa a "
+                     "descoberta automatica da janela")
 args = ap.parse_args()
 
 TOKEN_FILE = Path(os.path.expanduser(f"~/.cache/tv-cast-restore-token-{args.source}"))
@@ -79,6 +85,223 @@ def start(res):
     call("Start", GLib.Variant("(osa{sv})", (state["session"], "", {
         "handle_token": GLib.Variant("s", t)})))
 
+# ----------------------------------------------------------------- som por janela
+# O portal NAO diz qual janela foi escolhida — a resposta traz so o tamanho dela, e o
+# no do PipeWire tambem nao tem nada do alvo (conferido com pw-dump: node.name e
+# sempre "xdg-desktop-portal-hyprland"). Entao o dono da janela e descoberto casando
+# esse tamanho com a lista de janelas do Hyprland.
+
+def ancestrais(pid):
+    """O pid e todos os pais dele, ate o init."""
+    fora, atual = [], pid
+    for _ in range(32):
+        fora.append(atual)
+        try:
+            # o comm fica entre parenteses e pode ter espacos — cortar pelo ultimo ")"
+            ppid = int(open(f"/proc/{atual}/stat").read().rsplit(") ", 1)[1].split()[1])
+        except Exception:
+            break
+        if ppid <= 1:
+            break
+        atual = ppid
+    return fora
+
+
+def pw_dump():
+    return json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True,
+                                     check=True).stdout)
+
+
+def pid_da_janela(w, h):
+    """Qual processo e dono da janela de w x h. None se nao der pra ter certeza."""
+    try:
+        js = json.loads(subprocess.run(["hyprctl", "-j", "clients"], capture_output=True,
+                                       text=True, check=True).stdout)
+    except Exception as e:
+        print(f"nao consegui falar com o Hyprland ({e})", file=sys.stderr)
+        return None
+    cand = [c for c in js if tuple(c.get("size") or ()) == (w, h) and c.get("pid", 0) > 0]
+    if not cand:
+        print(f"nenhuma janela de {w}x{h} na lista do Hyprland", file=sys.stderr)
+        return None
+    if len(cand) > 1:
+        # empate no tamanho: fica com a que esta tocando algo agora
+        try:
+            tocando = set()
+            for n in pw_dump():
+                p = n.get("info", {}).get("props", {})
+                if p.get("media.class") == "Stream/Output/Audio":
+                    try:
+                        tocando.add(int(p.get("application.process.id")))
+                    except (TypeError, ValueError):
+                        pass
+            # quem toca costuma ser um filho da janela, entao o teste e ao contrario:
+            # o pid da janela aparece na linhagem de quem esta tocando
+            com_som = [c for c in cand
+                       if any(c["pid"] in ancestrais(t) for t in tocando)]
+            if len(com_som) == 1:
+                cand = com_som
+        except Exception:
+            pass
+    if len(cand) > 1:
+        print(f"{len(cand)} janelas tem {w}x{h}; nao da pra saber qual foi escolhida",
+              file=sys.stderr)
+        return None
+    print(f"janela: {cand[0].get('class')} — {cand[0].get('title', '')[:50]} "
+          f"(pid {cand[0]['pid']})", flush=True)
+    return cand[0]["pid"]
+
+
+# Para onde cada canal do programa vai no destino estereo.
+CANAIS = {"FL": ["FL"], "FR": ["FR"], "MONO": ["FL", "FR"], "FC": ["FL", "FR"],
+          "RL": ["FL"], "RR": ["FR"], "SL": ["FL"], "SR": ["FR"], "LFE": []}
+
+
+class SomDoApp:
+    """Um destino de audio so nosso, alimentado apenas pelo programa escolhido.
+
+    Cria um sink nulo e liga nele as saidas do programa — SEM desligar as ligacoes
+    que ele ja tem com as caixas de som, entao o som continua saindo no PC. O ffmpeg
+    grava o monitor desse sink, que so tem esse programa dentro.
+
+    O sink nulo e o ponto fixo da historia: programas destroem e recriam o no de audio
+    o tempo todo (trocar de video no navegador ja faz isso), e gravar direto do no do
+    programa morreria junto. O sink nulo continua existindo — e entregando silencio,
+    o que mantem o relogio do RTP andando — enquanto a thread religa o que aparecer.
+    """
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.sink = f"tvcast_{os.getpid()}"
+        self.modulo = None
+        self.parar = threading.Event()
+        self.thread = None
+
+    def abrir(self):
+        antes = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                               text=True).stdout.strip()
+        self.modulo = subprocess.run(
+            ["pactl", "load-module", "module-null-sink", f"sink_name={self.sink}",
+             "media.class=Audio/Sink", "channel_map=front-left,front-right",
+             "sink_properties=device.description=TV (espelhamento)"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        atexit.register(self.fechar)
+        # se o sistema resolver mudar a saida padrao pro sink novo, desfazer
+        depois = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                                text=True).stdout.strip()
+        if antes and depois != antes:
+            subprocess.run(["pactl", "set-default-sink", antes], check=False)
+        self.thread = threading.Thread(target=self._laco, daemon=True)
+        self.thread.start()
+        return f"{self.sink}.monitor"
+
+    def _portas(self, dump):
+        """{id do no: {'in': {...}, 'out': {...}}} com as portas de audio de cada no."""
+        fora = {}
+        for o in dump:
+            if o.get("type") != "PipeWire:Interface:Port":
+                continue
+            p = o.get("info", {}).get("props", {})
+            nome = p.get("port.name", "")
+            lado = "out" if p.get("port.direction") == "out" else "in"
+            canal = nome.rsplit("_", 1)[-1] if "_" in nome else nome
+            fora.setdefault(p.get("node.id"), {"in": {}, "out": {}})[lado][canal] = o["id"]
+        return fora
+
+    def _laco(self):
+        # Rapido no comeco (o programa pode abrir o som logo depois do cast comecar),
+        # calmo depois. Cada passada custa ~15 ms: um pw-dump de 250 kB e o parse dele.
+        passada = 0
+        while not self.parar.is_set():
+            try:
+                self._religar()
+            except Exception as e:
+                print(f"religando o audio: {e}", file=sys.stderr)
+            passada += 1
+            self.parar.wait(0.4 if passada < 15 else 1.5)
+
+    def _religar(self):
+        dump = pw_dump()
+        portas = self._portas(dump)
+        destino = next((o["id"] for o in dump
+                        if o.get("type") == "PipeWire:Interface:Node"
+                        and o.get("info", {}).get("props", {}).get("node.name") == self.sink),
+                       None)
+        if destino is None or destino not in portas:
+            return
+        alvo = portas[destino]["in"]
+        ligado = {(l["info"]["output-port-id"], l["info"]["input-port-id"])
+                  for l in dump if l.get("type") == "PipeWire:Interface:Link"}
+        for o in dump:
+            if o.get("type") != "PipeWire:Interface:Node":
+                continue
+            p = o.get("info", {}).get("props", {})
+            if p.get("media.class") != "Stream/Output/Audio":
+                continue
+            try:
+                dono = int(p.get("application.process.id"))
+            except (TypeError, ValueError):
+                continue
+            # o processo que toca costuma ser filho do dono da janela (o navegador
+            # toca num processo separado), entao vale qualquer um da mesma linhagem
+            if self.pid not in ancestrais(dono) and dono not in ancestrais(self.pid):
+                continue
+            saidas = portas.get(o["id"], {}).get("out", {})
+            for porta, dsts in self._mapa(saidas).items():
+                for d in dsts:
+                    if d in alvo and (porta, alvo[d]) not in ligado:
+                        subprocess.run(["pw-link", str(porta), str(alvo[d])],
+                                       check=False, capture_output=True)
+
+    @staticmethod
+    def _mapa(saidas):
+        """{porta do programa: canais do destino}. Mono vai pros dois lados, surround
+        e dobrado nos dois da frente. Nome fora do padrao (output_1) cai pela ordem."""
+        if saidas and all(c in CANAIS for c in saidas):
+            return {p: CANAIS[c] for c, p in saidas.items()}
+        ordem = [p for _, p in sorted(saidas.items())]
+        if len(ordem) == 1:
+            return {ordem[0]: ["FL", "FR"]}
+        return {ordem[0]: ["FL"], ordem[1]: ["FR"]} if ordem else {}
+
+    def fechar(self):
+        self.parar.set()
+        if self.modulo:
+            subprocess.run(["pactl", "unload-module", self.modulo], check=False,
+                           capture_output=True)
+            self.modulo = None
+
+
+def monitor_padrao():
+    return subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                          text=True, check=True).stdout.strip() + ".monitor"
+
+
+def fonte_de_audio(props):
+    """Nome da fonte do PulseAudio que o ffmpeg vai gravar."""
+    pid = args.audio_pid or None
+    if pid is None and args.audio_source == "janela":
+        if props.get("source_type") == 1:   # 1 = monitor: o tamanho e o da tela inteira
+            print("tela inteira nao tem um dono; vai o som do sistema", file=sys.stderr)
+            return monitor_padrao()
+        w, h = props.get("size", (0, 0))
+        pid = pid_da_janela(w, h)
+        if pid is None:
+            print("nao identifiquei o programa; vai o som do sistema", file=sys.stderr)
+    if not pid:
+        return monitor_padrao()
+    try:
+        som = SomDoApp(pid)
+        fonte = som.abrir()
+    except Exception as e:
+        # sem pipewire-utils, por exemplo: melhor mandar tudo do que ficar mudo
+        print(f"nao consegui separar o som ({e}); vai o som do sistema", file=sys.stderr)
+        return monitor_padrao()
+    state["som"] = som
+    print(f"som: apenas o programa do pid {pid}", flush=True)
+    return fonte
+
+
 def stream(res):
     streams = res.get("streams", [])
     if not streams:
@@ -122,8 +345,7 @@ def stream(res):
     if not args.no_audio:
         aport = args.audio_port or (args.port + 2)
         try:
-            mon = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
-                                 text=True, check=True).stdout.strip() + ".monitor"
+            mon = fonte_de_audio(props)
             # PCM cru (L16): sem latencia de codec. Estereo 48k = ~1.5 Mbps, irrelevante na LAN.
             au = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "pulse", "-i", mon,
                   "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16be", "-payload_type", "96",
@@ -195,6 +417,8 @@ def stop(*_):
             except Exception:
                 pass
     state["procs"] = []
+    if state.get("som"):
+        state.pop("som").fechar()   # tira o sink nulo da lista de saidas do sistema
     if tinha:
         tela_sem_sinal()
     loop.quit()
