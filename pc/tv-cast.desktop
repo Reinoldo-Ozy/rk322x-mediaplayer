@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Transmitir para a TV
+GenericName=Espelhamento de tela
+Comment=Envia esta tela para a TV em Full HD 60 fps
+Exec=python3 /home/reinoldo/Documents/rk322x/scripts/tv-cast-gui.py
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=tv;transmitir;espelhar;cast;tela;hdmi;
+StartupNotify=true

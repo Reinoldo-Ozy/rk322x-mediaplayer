@@ -1,0 +1,14 @@
+#!/bin/bash
+# Receptor de audio na TV (RK3229). PCM cru L16 por RTP.
+# buffer-time BAIXO e essencial: o padrao do alsasink e 200ms, que dessincroniza do video.
+PORT=${TV_AUDIO_PORT:-5006}
+JB=${TV_AUDIO_JITTER:-20}
+DEV=${TV_AUDIO_DEV:-hw:2}
+BUF=${TV_AUDIO_BUFFER:-40000}
+exec gst-launch-1.0 \
+  udpsrc port=$PORT \
+    caps="application/x-rtp,media=audio,encoding-name=L16,payload=96,clock-rate=48000,channels=2" \
+  ! rtpjitterbuffer latency=$JB \
+  ! rtpL16depay ! audioconvert ! audioresample \
+  ! "audio/x-raw,rate=48000,channels=2" \
+  ! alsasink device=$DEV sync=true buffer-time=$BUF latency-time=10000

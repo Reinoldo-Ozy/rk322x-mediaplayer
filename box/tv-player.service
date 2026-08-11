@@ -1,0 +1,12 @@
+[Unit]
+Description=Player de video controlavel do box (RTP/HTTP -> VPU -> HDMI)
+After=multi-user.target rk322x-dmc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tv-player
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

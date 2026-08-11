@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Player de video do box RK3229, controlavel por rede.
+
+Decodifica por hardware (rkvdec) e desenha direto no DRM (kmssink), sem
+recodificar e sem passar pela CPU. Aceita comandos JSON por TCP.
+
+Protocolo (uma linha JSON por comando, resposta em uma linha JSON):
+  {"cmd":"play","url":"..."}      toca agora (limpa a fila)
+  {"cmd":"add","url":"..."}       adiciona a fila
+  {"cmd":"pause"} {"cmd":"resume"} {"cmd":"toggle"}
+  {"cmd":"seek","pos":123.4}      posicao absoluta em segundos
+  {"cmd":"skip","delta":30}       relativo
+  {"cmd":"next"} {"cmd":"prev"}
+  {"cmd":"stop"}                  para e libera a TV
+  {"cmd":"status"}                estado, posicao, duracao, fila
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import GLib, Gst
+
+PORTA = int(os.environ.get("TV_PLAYER_PORT", "5010"))
+YTDLP = os.environ.get("YTDLP", "/usr/local/bin/yt-dlp")
+SERVICOS = ["tv-receiver.service", "tv-receiver-audio.service"]
+
+Gst.init(None)
+
+
+def systemctl(acao):
+    for s in SERVICOS:
+        subprocess.run(["systemctl", acao, s], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+
+def esperar_dispositivos(timeout=6.0):
+    """`systemctl stop` retorna antes do processo morrer de fato — se abrirmos o
+    audio nesse intervalo, da "Could not open audio device for playback"."""
+    import time
+    # Este daemon usa GStreamer em processo, entao qualquer gst-launch vivo e
+    # resquicio (do tv-play antigo ou dos servicos de espelhamento) e pode sair.
+    subprocess.run(["pkill", "-x", "gst-launch-1.0"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    fim = time.time() + timeout
+    while time.time() < fim:
+        livre = subprocess.run(["fuser", "/dev/snd/pcmC2D0p"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL).returncode != 0
+        sem_gst = subprocess.run(["pgrep", "-x", "gst-launch-1.0"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode != 0
+        if livre and sem_gst:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def resolver(url):
+    """Uma unica chamada ao yt-dlp: cada invocacao refaz toda a extracao, o que
+    num Cortex-A7 custa dezenas de segundos."""
+    try:
+        p = subprocess.run([YTDLP, "--no-warnings", "-J", url],
+                           capture_output=True, text=True, timeout=120)
+        d = json.loads(p.stdout)
+    except Exception as e:
+        return None, f"nao consegui resolver: {e}"
+
+    fmts = d.get("formats", [])
+
+    def melhor(cond):
+        c = [f for f in fmts if cond(f)]
+        return max(c, key=lambda f: f.get("tbr") or 0) if c else None
+
+    def cabe(f):
+        """Nao filtrar so por 'height <= 1080': em video VERTICAL a altura e a
+        maior dimensao (ex.: 720x1280) e a regra descartava o melhor formato,
+        caindo para 480p. O que importa e caber na tela em qualquer orientacao."""
+        w, h = f.get("width") or 0, f.get("height") or 0
+        if not w or not h:
+            return False
+        return max(w, h) <= 1920 and min(w, h) <= 1080
+
+    # H.264 ate 1080p e o unico com decodificacao de hardware confiavel aqui:
+    # VP9 as vezes devolve 403 no link direto e AV1 o chip nao decodifica.
+    ao_vivo = bool(d.get("is_live"))
+    if ao_vivo:
+        # Ao vivo o YouTube so entrega HLS (m3u8), e audio+video vem juntos
+        # no mesmo fluxo MPEG-TS — nao existe ramo de audio separado.
+        v = melhor(lambda f: (f.get("vcodec") or "").startswith("avc1")
+                   and cabe(f) and "m3u8" in (f.get("protocol") or ""))
+        if not v:
+            return None, "transmissao ao vivo sem formato H.264 compativel"
+        return {"titulo": d.get("title", ""), "dur": 0, "vivo": True,
+                "v": v["url"], "a": "", "aext": ""}, None
+
+    v = melhor(lambda f: (f.get("vcodec") or "").startswith("avc1")
+               and cabe(f) and f.get("acodec") in (None, "none"))
+    a = melhor(lambda f: (f.get("acodec") or "none") != "none"
+               and f.get("vcodec") in (None, "none"))
+    if not v:
+        v = melhor(lambda f: (f.get("vcodec") or "").startswith("avc1") and cabe(f))
+    if not v:
+        return None, "sem formato H.264 compativel para este link"
+    return {"titulo": d.get("title", ""), "dur": d.get("duration") or 0,
+            "vivo": False, "v": v["url"], "a": (a or {}).get("url", ""),
+            "aext": (a or {}).get("ext", "")}, None
+
+
+class Player:
+    def __init__(self):
+        self.pipe = None
+        self.fila = []          # [{url, titulo}]
+        self.idx = -1
+        self.atual = None
+        self.lock = threading.RLock()
+        self.ocupado = False
+        self.loop = GLib.MainLoop()
+
+    # ---------------------------------------------------------------- pipeline
+    def montar(self, info):
+        self.derrubar()
+        systemctl("stop")
+        esperar_dispositivos()
+
+        aud = ""
+        if info["a"] and not getattr(self, "sem_audio", False):
+            demux = ("matroskademux ! opusparse ! opusdec" if info["aext"] == "webm"
+                     else "qtdemux ! aacparse ! avdec_aac")
+            aud = (f' souphttpsrc location="{info["a"]}"'
+                   " ! queue max-size-bytes=4194304 max-size-time=0 max-size-buffers=0"
+                   f" ! {demux} ! audioconvert ! audioresample"
+                   " ! audio/x-raw,rate=48000,channels=2"
+                   " ! alsasink device=hw:2 sync=true buffer-time=100000")
+
+        if info.get("vivo"):
+            # HLS: os segmentos sao MPEG-TS com audio e video juntos.
+            desc = (f'souphttpsrc location="{info["v"]}"'
+                    " ! hlsdemux ! tsdemux name=d"
+                    " d. ! queue max-size-bytes=8388608 ! h264parse ! v4l2slh264dec"
+                    " ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true"
+                    " d. ! queue max-size-bytes=8388608 max-size-time=0 max-size-buffers=0"
+                    " ! aacparse ! avdec_aac"
+                    " ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2"
+                    # sync=false SO no ao vivo: com sync=true o sink tenta casar cada
+                    # buffer com o relogio e realinha ~37x/s (medido: 1580 avisos em 40s),
+                    # e cada realinhamento e um micro-corte audivel. Sem sincronia: 0.
+                    # Aqui e seguro porque audio e video vem no MESMO MPEG-TS e o HLS
+                    # ja entrega em ritmo de tempo real.
+                    " ! alsasink device=hw:2 sync=false buffer-time=200000")
+        else:
+            desc = (f'souphttpsrc location="{info["v"]}"'
+                    " ! queue max-size-bytes=20971520 max-size-time=0 max-size-buffers=0"
+                    " ! qtdemux ! h264parse ! v4l2slh264dec"
+                    " ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true"
+                    + aud)
+
+        self.pipe = Gst.parse_launch(desc)
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", lambda *_: self.proximo())
+        bus.connect("message::error", self.ao_erro)
+        self.pipe.set_state(Gst.State.PLAYING)
+        self.atual = info
+
+    def ao_erro(self, _bus, msg):
+        err, _ = msg.parse_error()
+        print(f"erro no pipeline: {err}", file=sys.stderr, flush=True)
+        self.proximo()
+
+    def derrubar(self):
+        if self.pipe:
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe = None
+        self.atual = None
+
+    # ----------------------------------------------------------------- comandos
+    def tocar_indice(self, i):
+        with self.lock:
+            if not (0 <= i < len(self.fila)):
+                self.derrubar()
+                systemctl("start")
+                return {"ok": False, "erro": "fim da fila"}
+            self.idx = i
+            self.ocupado = True
+            try:
+                info, erro = resolver(self.fila[i]["url"])
+            finally:
+                self.ocupado = False
+            if erro:
+                return {"ok": False, "erro": erro}
+            self.fila[i]["titulo"] = info["titulo"]
+            self.montar(info)
+            return {"ok": True, "titulo": info["titulo"]}
+
+    def play(self, url, sem_audio=False):
+        with self.lock:
+            self.sem_audio = sem_audio
+            self.fila = [{"url": url, "titulo": ""}]
+            return self.tocar_indice(0)
+
+    def add(self, url):
+        with self.lock:
+            self.fila.append({"url": url, "titulo": ""})
+            if self.pipe is None:
+                return self.tocar_indice(len(self.fila) - 1)
+            return {"ok": True, "fila": len(self.fila)}
+
+    def proximo(self):
+        with self.lock:
+            return self.tocar_indice(self.idx + 1)
+
+    def anterior(self):
+        with self.lock:
+            return self.tocar_indice(self.idx - 1)
+
+    def pausar(self, estado=None):
+        with self.lock:
+            if not self.pipe:
+                return {"ok": False, "erro": "nada tocando"}
+            _, st, _ = self.pipe.get_state(0)
+            if estado is None:
+                alvo = (Gst.State.PAUSED if st == Gst.State.PLAYING
+                        else Gst.State.PLAYING)
+            else:
+                alvo = Gst.State.PAUSED if estado else Gst.State.PLAYING
+            self.pipe.set_state(alvo)
+            return {"ok": True, "pausado": alvo == Gst.State.PAUSED}
+
+    def buscar(self, pos):
+        with self.lock:
+            if not self.pipe:
+                return {"ok": False, "erro": "nada tocando"}
+            pos = max(0, pos)
+            q = Gst.Query.new_seeking(Gst.Format.TIME)
+            pode = self.pipe.query(q)
+            seekable = q.parse_seeking()[1] if pode else False
+            ok = self.pipe.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                int(pos * Gst.SECOND))
+            return {"ok": bool(ok), "pos": pos,
+                    "consultou": bool(pode), "buscavel": bool(seekable)}
+
+    def pular(self, delta):
+        p = self.posicao()[0]
+        return self.buscar(p + delta)
+
+    def posicao(self):
+        if not self.pipe:
+            return 0.0, 0.0
+        okp, pos = self.pipe.query_position(Gst.Format.TIME)
+        okd, dur = self.pipe.query_duration(Gst.Format.TIME)
+        p = pos / Gst.SECOND if okp and pos > 0 else 0.0
+        d = dur / Gst.SECOND if okd and dur > 0 else float(
+            (self.atual or {}).get("dur") or 0)
+        return p, d
+
+    def parar(self):
+        with self.lock:
+            self.derrubar()
+            self.fila, self.idx = [], -1
+            systemctl("start")
+            return {"ok": True}
+
+    def status(self):
+        """Sem lock de proposito: enquanto o yt-dlp resolve um link ele segura o
+        lock por dezenas de segundos, e a interface (que consulta a cada segundo)
+        ficava presa ate estourar o timeout, exibindo um erro que nao existia.
+        Ler o estado sem lock pode dar uma leitura levemente defasada — irrelevante
+        aqui, e muito melhor que travar o cliente."""
+        pipe, atual = self.pipe, self.atual
+        p = d = 0.0
+        st = "parado"
+        if pipe:
+            try:
+                okp, pos = pipe.query_position(Gst.Format.TIME)
+                okd, dur = pipe.query_duration(Gst.Format.TIME)
+                p = pos / Gst.SECOND if okp and pos > 0 else 0.0
+                d = dur / Gst.SECOND if okd and dur > 0 else float(
+                    (atual or {}).get("dur") or 0)
+                _, e, _ = pipe.get_state(0)
+                st = "pausado" if e == Gst.State.PAUSED else "tocando"
+            except Exception:
+                pass
+        elif self.ocupado:
+            st = "resolvendo"
+        return {"ok": True, "estado": st, "pos": round(p, 1),
+                "dur": round(d, 1), "vivo": bool((atual or {}).get("vivo")),
+                "titulo": (atual or {}).get("titulo", ""),
+                "idx": self.idx,
+                "fila": [f["titulo"] or f["url"] for f in self.fila]}
+
+
+PL = Player()
+
+
+def atender(conn):
+    try:
+        dados = conn.makefile("r").readline()
+        req = json.loads(dados or "{}")
+        c = req.get("cmd", "")
+        if c == "play":      r = PL.play(req["url"], req.get("sem_audio", False))
+        elif c == "add":     r = PL.add(req["url"])
+        elif c == "pause":   r = PL.pausar(True)
+        elif c == "resume":  r = PL.pausar(False)
+        elif c == "toggle":  r = PL.pausar(None)
+        elif c == "seek":    r = PL.buscar(float(req.get("pos", 0)))
+        elif c == "skip":    r = PL.pular(float(req.get("delta", 0)))
+        elif c == "next":    r = PL.proximo()
+        elif c == "prev":    r = PL.anterior()
+        elif c == "stop":    r = PL.parar()
+        elif c == "status":  r = PL.status()
+        else:                r = {"ok": False, "erro": "comando desconhecido"}
+    except Exception as e:
+        r = {"ok": False, "erro": str(e)}
+    try:
+        conn.sendall((json.dumps(r) + "\n").encode())
+    except Exception:
+        pass
+    conn.close()
+
+
+def servidor():
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", PORTA))
+    s.listen(8)
+    print(f"tv-player escutando na porta {PORTA}", flush=True)
+    while True:
+        conn, _ = s.accept()
+        threading.Thread(target=atender, args=(conn,), daemon=True).start()
+
+
+threading.Thread(target=servidor, daemon=True).start()
+PL.loop.run()

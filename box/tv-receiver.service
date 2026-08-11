@@ -1,0 +1,13 @@
+[Unit]
+Description=Receptor de video na TV (RTP H.264 -> VPU -> HDMI)
+After=multi-user.target rk322x-dmc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tv-receiver
+Restart=always
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

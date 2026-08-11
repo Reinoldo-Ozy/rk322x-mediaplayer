@@ -1,0 +1,11 @@
+#!/bin/bash
+# Receptor de video na TV (RK3229). Espera stream H.264 por RTP na porta 5004.
+# Config validada: zero-copy, 60fps, 0 drops, baixa latencia.
+PORT=${TV_PORT:-5004}
+JB=${TV_JITTER:-20}
+exec gst-launch-1.0 \
+  udpsrc port=$PORT buffer-size=16777216 \
+    caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
+  ! rtpjitterbuffer latency=$JB \
+  ! rtph264depay ! h264parse ! v4l2slh264dec \
+  ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true

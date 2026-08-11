@@ -1,6 +1,10 @@
 # Hardware H.264 Decode on RK322x — Mainline Kernel 6.6
 
-Hardware-accelerated 720p H.264 video playback on Rockchip RK322x TV boxes using the mainline Linux kernel, GStreamer, and open-source drivers only. No Android, no proprietary blobs, no BSP kernel.
+Hardware-accelerated **1080p60** H.264 video playback on Rockchip RK322x TV boxes using the mainline Linux kernel, GStreamer, and open-source drivers only. No Android, no proprietary blobs, no BSP kernel.
+
+> **Update:** this project originally documented a 720p ceiling and attributed it to a hardware
+> limitation. That was wrong. **1080p60 runs with zero dropped frames** on the same hardware and
+> the same mainline kernel — see [Full HD, corrected](#full-hd-corrected) below.
 
 ---
 
@@ -69,7 +73,11 @@ The RK322x hardware decoder (`rkvdec`) handles H.264 decode. The CPU only parses
 | 1080p@30fps H.264 | rkvdec (hardware) | ❌ ~13fps — not real-time |
 | 1080p@30fps H.264 | avdec_h264 (software) | ❌ Real-time without display, drops frames with kmssink |
 
-**Use 720p or below.** 1080p fails not because of the decoder itself, but because writing 1080p NV12 frames (~90 MB/s) to uncached DRM memory exceeds what the Cortex-A7 can sustain. This is a hardware limitation with no software fix on the mainline kernel.
+**Superseded — 1080p60 works.** The reasoning above identified the right mechanism (copying
+decoded frames out of uncached VPU memory is brutally expensive on a Cortex-A7) but drew the
+wrong conclusion. The fix is to **never copy at all**: keep the frame as a DMA-BUF from the
+decoder straight to the display plane, and disable two GStreamer behaviours that were halving
+the frame rate. See [Full HD, corrected](#full-hd-corrected).
 
 ---
 
@@ -293,3 +301,68 @@ yt-dlp takes 10–15 seconds to resolve YouTube URLs. During that time, GStreame
 This project was developed with the assistance of [Claude](https://claude.ai) (Anthropic). The debugging sessions, GStreamer pipeline design, kernel driver research, and documentation were done collaboratively between the author and Claude Code.
 
 All code was tested on real hardware. The AI assisted in reasoning through kernel internals (V4L2 stateless API, Rockchip EPHY driver, DRM memory bandwidth constraints) and iterating on the GStreamer pipeline until it worked correctly on the actual device.
+
+
+---
+
+## Full HD, corrected
+
+The 720p ceiling documented above was a **measurement artifact**, not a hardware limit.
+
+### The measurement that misled us
+
+Benchmarks used `fakesink`, which forces the decoded frame to be copied into system RAM.
+On this SoC the VPU's buffers are not cache-coherent, so that copy costs ~90% of throughput:
+
+| Step (1080p60) | Result |
+|---|---|
+| Decode only, frame stays in VPU memory | **102 fps** (225 fps with memory scaling enabled) |
+| + copy back to system RAM | **10 fps** |
+
+Measured without the copy, the decoder sustains **231 fps at 1080p** — roughly four times what
+60 fps needs. The silicon was never the problem.
+
+### What actually capped it at 30 fps
+
+Two GStreamer settings, not hardware:
+
+```bash
+kmssink driver-name=rockchip skip-vsync=true qos=false sync=true
+```
+
+1. **`skip-vsync=true`** — `kmssink` waits for vsync internally *and* the atomic DRM driver waits
+   again on commit. Double vsync = **exactly half the frame rate**. This is why the result was a
+   suspiciously round "30.00 fps" instead of a ragged number.
+2. **`qos=false`** — GStreamer's QoS was pre-emptively dropping frames it judged late, and the
+   lateness came from the double vsync. The two fed each other.
+
+Also required: no `videoconvert` anywhere in the chain (it breaks zero-copy), and the CRTC mode
+must match the stream resolution — a 720p stream on a 1080p CRTC drops from 60 fps to 18.
+
+### Verified results
+
+| Mode | Result |
+|---|---|
+| 1080p60 | **60.02 fps, 0 dropped frames** (reproduced) |
+| 1080p30 / 1080p25 / 720p60 | 0 dropped frames |
+| CPU while playing a link directly | **2.8%** |
+| CPU while mirroring the PC screen | 17% |
+
+Confirm zero-copy is active in the negotiated caps:
+
+```
+video/x-raw(memory:DMABuf), format=DMA_DRM, drm-format=NV12
+```
+
+### A complete system
+
+Beyond the pipeline fix, this repository now carries a working setup:
+
+- **`box/`** — a TCP-controllable player for the box (links, queue, pause, live/HLS streams)
+  plus receivers for screen mirroring, with systemd units and an installer.
+- **`pc/`** — a GTK4/libadwaita app for the desktop: paste a link to play it on the TV, or
+  mirror a screen or single window (Wayland portal capture, VA-API encoding, RTP).
+- **`docs/`** — architecture notes, measurements, and the diagnostic traps that cost the most
+  time (written in Portuguese).
+
+The original `yt-play` and proxy tooling documented above still works and remains in the repo.
