@@ -20,8 +20,23 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk
 
 CAST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tv-cast.py")
-BOX_HOST, BOX_USER = "192.168.10.159", "reinoldo"
-BOX_PORTA_PLAYER = 5010
+# Endereco do box: variavel de ambiente, ou ~/.config/tv-cast.conf, ou o padrao.
+# Nao deixar fixo no fonte — quem clonar o repositorio tem outro IP.
+def _conf(chave, padrao):
+    v = os.environ.get(chave)
+    if v:
+        return v
+    caminho = os.path.expanduser("~/.config/tv-cast.conf")
+    if os.path.exists(caminho):
+        for linha in open(caminho):
+            if linha.strip().startswith(chave + "="):
+                return linha.split("=", 1)[1].strip()
+    return padrao
+
+
+BOX_HOST = _conf("TV_BOX_HOST", "192.168.10.159")
+BOX_USER = _conf("TV_BOX_USER", "reinoldo")
+BOX_PORTA_PLAYER = int(_conf("TV_BOX_PORT", "5010"))
 
 
 def token_de(origem):

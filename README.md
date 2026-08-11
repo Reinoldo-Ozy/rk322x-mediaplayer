@@ -94,15 +94,23 @@ proxy/  original yt-dlp proxy (still works, see below)
 |---|---|
 | `tv-cast-gui.py` | GTK4/libadwaita app: play a link on the TV, media controls, mirroring |
 | `tv-cast.py` | Mirroring: Wayland portal capture → VA-API encode → RTP |
-| `tv-cast.desktop` | Application menu entry |
+| `tv-cast.desktop.in` | Application menu entry template |
+| `instalar.sh` | Generates the menu entry with the correct path for this checkout |
 | `portal-screencast.py` | Utility: request a PipeWire node from the portal (diagnostics) |
 
 Needs GTK4 + libadwaita, `python3-gi`, `ffmpeg`, and GStreamer with `pipewiresrc`, `vapostproc`
 and `vah264enc`, plus a Wayland compositor with a screencast portal.
 
 ```bash
-cp pc/tv-cast.desktop ~/.local/share/applications/
-python3 pc/tv-cast-gui.py
+./pc/instalar.sh          # adds it to the application menu
+python3 pc/tv-cast-gui.py # or just run it
+```
+
+The box address defaults to `192.168.10.159`. Override it without editing any source:
+
+```bash
+echo 'TV_BOX_HOST=192.168.1.50' >> ~/.config/tv-cast.conf
+# or, per run:  TV_BOX_HOST=192.168.1.50 python3 pc/tv-cast-gui.py
 ```
 
 ### `box/` — the TV box
