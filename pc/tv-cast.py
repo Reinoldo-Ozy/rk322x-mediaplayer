@@ -18,7 +18,8 @@ TIPOS = {"monitor": 1, "janela": 2, "ambos": 3}
 IFACE = "org.freedesktop.portal.ScreenCast"
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--host", default="192.168.10.159")
+ap.add_argument("--host", default=os.environ.get("TV_BOX_HOST", "192.168.10.159"),
+                help="IP do box (ou variavel TV_BOX_HOST)")
 ap.add_argument("--port", type=int, default=5004)
 ap.add_argument("--width", type=int, default=1920)
 ap.add_argument("--height", type=int, default=1080)
