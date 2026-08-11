@@ -1,0 +1,12 @@
+[Unit]
+Description=Receptor de audio na TV (RTP L16 -> HDMI)
+After=multi-user.target sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tv-receiver-audio
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Habilita DDR devfreq (DMC) do RK322x - destrava 786MHz
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "lsmod | grep -q rk3228_dmc || insmod /lib/modules/$(uname -r)/kernel/drivers/devfreq/rk3228_dmc.ko"
+ExecStop=/bin/sh -c "rmmod rk3228_dmc || true"
+
+[Install]
+WantedBy=multi-user.target
