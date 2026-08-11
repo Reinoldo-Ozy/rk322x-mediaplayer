@@ -85,7 +85,6 @@ ragged, drifting values. Exact halving means serialisation.
 pc/     runs on the Linux desktop
 box/    runs on the RK322x box
 docs/   architecture notes and measurements (Portuguese)
-proxy/  original yt-dlp proxy (still works, see below)
 ```
 
 ### `pc/` — desktop
@@ -233,31 +232,18 @@ the same trick Android uses.
 
 ---
 
-## Original yt-dlp proxy (still supported)
+## YouTube rate limiting
 
-The earlier approach — a proxy machine running yt-dlp and ffmpeg, muxing H.264+AAC into MPEG-TS
-and serving it over HTTP — still works and remains in this repo:
+Anonymous extraction gets throttled: during development the box started answering *"Sign in to
+confirm you're not a bot"* after a few dozen extractions in one afternoon. The fix is to give
+yt-dlp cookies exported from a browser logged into a throwaway account — a burner, not your main
+one, since anything with those cookies acts as that account.
 
-```
-YouTube URL → [proxy: yt-dlp + ffmpeg → MPEG-TS] → HTTP → [box: tsdemux → rkvdec → kmssink]
-```
-
-```bash
-sudo ./install-proxy.sh        # on the proxy machine
-sudo ./install-box.sh <ip>     # on the box
-yt-play dQw4w9WgXcQ 720
-```
-
-`box/tv-player` supersedes it for most uses — it resolves links on the box itself, needs no second
-machine, and adds a queue and playback controls. The proxy is still useful when you want the
-heavy lifting elsewhere, or want cookies handled on a machine you trust.
-
-### YouTube cookies
-
-Without cookies, yt-dlp works anonymously, and YouTube may throttle or block requests — during
-development the box was rate-limited with *"Sign in to confirm you're not a bot"* after a few
-dozen extractions in an afternoon. Exporting cookies from a logged-in browser avoids most of it.
-See `install-proxy.sh` and the `COOKIES` setting in `proxy/yt_proxy.py`.
+> An earlier version of this project played YouTube through a **proxy machine** running yt-dlp and
+> ffmpeg, with the box only consuming MPEG-TS over HTTP. `box/tv-player` replaced it entirely — the
+> box resolves links by itself, needs no second machine, and adds a queue and playback controls.
+> The proxy code was removed in favour of keeping one working path; it is still in the history if
+> anyone wants it.
 
 ---
 
