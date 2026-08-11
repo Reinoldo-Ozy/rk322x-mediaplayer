@@ -10,7 +10,7 @@ Hardware-accelerated **1080p60** H.264 video playback on Rockchip RK322x TV boxe
 
 ## What this is
 
-A technical foundation for running H.264 video at 720p in real-time on cheap RK322x TV boxes (MXQ Pro, TX3 Mini, and similar) under Armbian with kernel 6.6.
+A technical foundation for running H.264 video in real-time — **up to 1080p60** — on cheap RK322x TV boxes (MXQ Pro, TX3 Mini, and similar) under Armbian with a mainline kernel.
 
 **This is not a plug-and-play media center.** There is no graphical interface, no YouTube app, no remote control. What you get is:
 
@@ -24,7 +24,7 @@ Think of this as the building block. You can build a UI, a kiosk, a simple media
 
 ## Why this matters
 
-Most RK322x guides use the old Rockchip BSP kernel (4.4), proprietary RKMPP blobs, and the Jock's media framework. This guide achieves hardware decode on **mainline kernel 6.6** using:
+Most RK322x guides use the old Rockchip BSP kernel (4.4) and proprietary RKMPP blobs. This guide achieves hardware decode on a **mainline kernel** using:
 
 - `rkvdec` — the upstream V4L2 stateless decoder driver
 - `v4l2slh264dec` — the GStreamer element for stateless decode
@@ -44,6 +44,7 @@ This approach is reproducible, upgrade-friendly, and doesn't require replacing t
 - Internet connection (Ethernet or USB WiFi)
 
 > **Tested on:** MXQ Pro-style box with RK3229, Armbian 24.2.5 Bookworm, kernel 6.6.22-current-rockchip
+> — and, for the 1080p60 results, Armbian Trixie with kernel 6.18.10-current-rockchip
 
 ---
 
@@ -280,7 +281,8 @@ yt-dlp takes 10–15 seconds to resolve YouTube URLs. During that time, GStreame
 
 ### Kernel and distribution requirements
 
-**Kernel 6.6 (Armbian 24.x current-rockchip) is strongly recommended.**
+**Kernel 6.6 or newer (Armbian 24.x current-rockchip and later) is required.** The 1080p60
+results were obtained on 6.18.10.
 
 - The V4L2 stateless decoder API used by `v4l2slh264dec` was stabilized in kernel 5.18. Kernel 5.15 has partial support but behavior may differ.
 - GStreamer 1.22 (Debian Bookworm) was used for all tests. GStreamer 1.18 (Debian Bullseye) includes `v4l2slh264dec` but has known limitations in stateless H.264 decode — **not tested with this setup**.
