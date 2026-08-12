@@ -8,4 +8,10 @@ exec gst-launch-1.0 \
     caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
   ! rtpjitterbuffer latency=$JB \
   ! rtph264depay ! h264parse ! v4l2slh264dec \
-  ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true
+  ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true \
+      max-lateness=200000000
+# max-lateness de fabrica: 5 ms. Quadro que chegue mais atrasado que isso e
+# DESCARTADO, e a TV fica segurando o ultimo — indistinguivel de travamento
+# ("A lot of buffers are being dropped" no log). 200 ms de folga mostram o
+# quadro atrasado em vez de sumir com ele; nao adiciona latencia, so muda o
+# destino de quem ja chegou tarde.

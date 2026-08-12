@@ -230,6 +230,7 @@ ffmpeg streaming audio to the TV forever.
 | File | Purpose |
 |---|---|
 | `tv-player` | TCP-controllable player: links, queue, pause, live/HLS |
+| `tv-web` | Web remote on port 8080 — paste a link and control playback from a phone, with no desktop involved |
 | `tv-receiver` | Receives mirrored video (RTP H.264) |
 | `tv-receiver-audio` | Receives mirrored audio (RTP L16) |
 | `rk322x-dmc.service` | Enables memory frequency scaling (see below) |
@@ -238,6 +239,59 @@ ffmpeg streaming audio to the TV forever.
 ```bash
 sudo ./box/instalar.sh
 ```
+
+#### A frozen picture is usually a dropped frame
+
+`kmssink` discards any frame that arrives later than `max-lateness`, and the stock value is
+**5 ms**. One network hiccup and the frame is thrown away while the TV keeps holding the previous
+one — which looks exactly like a freeze, reports as nothing anywhere, and leaves only
+`A lot of buffers are being dropped` in the log. Both the player and the mirroring receiver now
+allow 200 ms. This adds no latency: it does not delay anything, it only decides what happens to a
+frame that is already late — show it late, or not at all.
+
+Nothing in this class reports itself as an error, which is why the player counts and logs
+GStreamer **warnings** (first, tenth, then every hundredth). Without that, a visible freeze leaves
+no trace at all.
+
+#### Live audio needs a clock, but a tolerant one
+
+Live playback used to run `alsasink sync=false`. The reason was real: with the stock settings the
+sink realigned about 37 times a second — one per audio buffer — and each realignment is an audible
+click. But dropping the clock trades a small problem for a worse one: free-running audio drifts
+away from the picture over a long stream.
+
+The fix is to keep `sync=true` and widen the trigger instead: `alignment-threshold` from 40 ms to
+200 ms, `discont-wait` from 1 s to 5 s. Four minutes of live measured afterwards: zero
+realignments logged.
+
+#### HLS costs more CPU than decoding does — and the fix is blocked upstream
+
+Measured on live 1080p60: the player at **143% CPU**, of which ~40% in `souphttpsrc` and ~30% in
+queue threads, against **~5% in video decoding**. The Cortex-A7 is spending its cycles fetching
+HTTPS and shuffling 188-byte TS packets, not decoding. The project's own design document names the
+cause: the old `hlsdemux` "used a new thread for each download".
+
+Its replacement, `hlsdemux2`/`adaptivedemux2`, fixes exactly that — and measured here it does:
+**143% → 23% CPU**, with a single shared downloader thread. But it cannot be used yet:
+
+- It refuses to run in a plain pipeline (`Element requires a streams-aware context`); by design it
+  "only work[s] in combination with the streams-aware playbin3 and uridecodebin3".
+- `playbin3` is not an option on this hardware: its `playsink` inserts
+  `deinterlace ! videoconvert ! videobalance ! videoscale` ahead of the sink, which breaks
+  zero-copy. The box cannot keep up, frames are dropped, and the demuxer eventually dies with
+  `Internal data stream error (-5)`.
+- `uridecodebin3` avoids playsink and keeps the hardware decoder (autoplugging prefers
+  `v4l2slh264dec`, rank 257, over `avdec_h264`, 256) — but audio stops after a few seconds. It is
+  not the HDMI path: with no video on screen at all, audio still stopped. GStreamer 1.26.10 lists
+  the matching fix — *"playbin3: HLS/DASH stream selection handling improvements to fix disabling
+  and re-enabling of audio/video streams with adaptivedemux2"* — and Debian 13 ships 1.26.2, whose
+  `+deb13uX` revisions carry security fixes only.
+
+So the live path still uses `hlsdemux + tsdemux`. Revisit it on GStreamer ≥ 1.26.10.
+
+Ruled out along the way, so nobody re-tests them: the HDMI modeset does not kill running audio (a
+tone survived one), and the TV accepts both S32_LE and S16_LE (its ELD lists 16/20/24 bits, but
+32-bit played fine).
 
 Needs Armbian with a mainline kernel, GStreamer 1.26 with `v4l2codecs` and `kmssink`,
 `python3-gi`, `gir1.2-gstreamer-1.0`, `gstreamer1.0-alsa`, and a current `yt-dlp`.
@@ -307,12 +361,26 @@ the same trick Android uses.
 
 ---
 
-## YouTube rate limiting
+## YouTube on a 32-bit ARM box
 
-Anonymous extraction gets throttled: during development the box started answering *"Sign in to
-confirm you're not a bot"* after a few dozen extractions in one afternoon. The fix is to give
-yt-dlp cookies exported from a browser logged into a throwaway account — a burner, not your main
-one, since anything with those cookies acts as that account.
+Two things bite here, and both produce the same useless symptom — yt-dlp returning only
+storyboard images.
+
+**The JavaScript challenge.** YouTube requires solving one before it hands over media URLs, and
+yt-dlp's default runtime is Deno, which publishes no armv7 binary. Debian 13's Node (20.19) is
+refused as too old. QuickJS is plain C, packaged by Debian, and accepted:
+
+```bash
+sudo apt install quickjs        # then: yt-dlp --js-runtimes quickjs
+```
+
+Diagnose with `yt-dlp -v ... | grep -i "JS runtimes"`. The `yt_dlp_ejs` package already ships
+inside the zipapp — `--remote-components ejs:github` is not needed.
+
+**Rate limiting.** Anonymous extraction gets throttled: during development the box started
+answering *"Sign in to confirm you're not a bot"* after a few dozen extractions in one afternoon.
+The fix is to give yt-dlp cookies exported from a browser logged into a throwaway account — a
+burner, not your main one, since anything with those cookies acts as that account.
 
 > An earlier version of this project played YouTube through a **proxy machine** running yt-dlp and
 > ffmpeg, with the box only consuming MPEG-TS over HTTP. `box/tv-player` replaced it entirely — the
@@ -333,7 +401,7 @@ one, since anything with those cookies acts as that account.
 | **A browser on the box** | ❌ A browser cannot reach the VPU and falls back to software decode. Software decode of 1080p manages 27 fps on a desktop i5 — roughly 10× faster per core than this A7. |
 | **Thermals** | ⚠️ 80 °C observed on a long 1080p60 live stream, with no heatsink. Throttling starts near 90 °C. |
 | **Mirroring a high-refresh display** | ⚠️ A source whose refresh is not a multiple of 60 judders no matter what. Set the mirrored output to 120 Hz (or 60). |
-| **Late frames** | ⚠️ `kmssink` drops buffers it considers late (`A lot of buffers are being dropped` in its log) instead of showing them behind schedule, which reads as a freeze. Giving it a `max-lateness` allowance is untested. |
+| **Live HLS CPU** | ⚠️ 143% CPU on live 1080p60, almost all of it HTTPS fetching and TS packet shuffling. The cure (`hlsdemux2`) needs GStreamer ≥ 1.26.10; Debian 13 ships 1.26.2. |
 
 ---
 

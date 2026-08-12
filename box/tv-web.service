@@ -1,0 +1,13 @@
+[Unit]
+Description=Pagina web para mandar links para a TV
+After=multi-user.target tv-player.service
+Wants=tv-player.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tv-web
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

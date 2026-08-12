@@ -27,6 +27,13 @@ from gi.repository import GLib, Gst
 
 PORTA = int(os.environ.get("TV_PLAYER_PORT", "5010"))
 YTDLP = os.environ.get("YTDLP", "/usr/local/bin/yt-dlp")
+# O YouTube exige resolver um desafio JavaScript antes de entregar as URLs de
+# midia. O runtime padrao do yt-dlp e o Deno, que nao publica binario armv7; o
+# Node do Debian 13 (20.19) e recusado por ser antigo demais ("unsupported").
+# O QuickJS e C puro, esta no repo do Debian e e aceito -- sem ele o yt-dlp so
+# enxerga os storyboards do video ("Only images are available for download").
+JSRT = os.environ.get("TV_JS_RUNTIME", "quickjs")
+COOKIES = os.environ.get("TV_COOKIES", "/usr/local/etc/yt-cookies.txt")
 SERVICOS = ["tv-receiver.service", "tv-receiver-audio.service"]
 
 Gst.init(None)
@@ -63,12 +70,34 @@ def esperar_dispositivos(timeout=6.0):
 def resolver(url):
     """Uma unica chamada ao yt-dlp: cada invocacao refaz toda a extracao, o que
     num Cortex-A7 custa dezenas de segundos."""
+    cmd = [YTDLP, "--no-warnings", "-J", "--js-runtimes", JSRT]
+    # Cookies sao opcionais: sem eles o YouTube costuma responder "Sign in to
+    # confirm you're not a bot" para um IP que so faz requisicao de API.
+    if COOKIES and os.path.exists(COOKIES):
+        cmd += ["--cookies", COOKIES]
+    def motivo(p, padrao):
+        """A causa util (bot check, cookie expirado, video fora do ar, runtime
+        ausente) sai toda no stderr; sem isso o usuario so ve "Expecting value"
+        ou um AttributeError."""
+        if p is None:
+            return str(padrao)
+        linha = next((l for l in reversed(p.stderr.splitlines())
+                      if "ERROR" in l or "WARNING" in l), "")
+        # "ERROR: [youtube] ID: mensagem" -> "mensagem"
+        return (linha.split(": ", 2)[-1] or str(padrao))[:160]
+
+    p = None
     try:
-        p = subprocess.run([YTDLP, "--no-warnings", "-J", url],
-                           capture_output=True, text=True, timeout=120)
+        p = subprocess.run(cmd + [url], capture_output=True, text=True,
+                           timeout=180)
         d = json.loads(p.stdout)
     except Exception as e:
-        return None, f"nao consegui resolver: {e}"
+        return None, motivo(p, e)
+
+    # Quando o yt-dlp falha depois de ja ter identificado o video ele imprime
+    # um "null" valido em vez de nada — sem este teste vira AttributeError.
+    if not isinstance(d, dict):
+        return None, motivo(p, "o yt-dlp nao devolveu dados deste link")
 
     fmts = d.get("formats", [])
 
@@ -119,6 +148,7 @@ class Player:
         self.atual = None
         self.lock = threading.RLock()
         self.ocupado = False
+        self.avisos = {}
         self.loop = GLib.MainLoop()
 
     # ---------------------------------------------------------------- pipeline
@@ -140,23 +170,44 @@ class Player:
         if info.get("vivo"):
             # HLS: os segmentos sao MPEG-TS com audio e video juntos.
             desc = (f'souphttpsrc location="{info["v"]}"'
+                    # O hlsdemux2 seria mais leve (um thread de download compartilhado
+                    # em vez de um souphttpsrc por segmento), mas exige contexto
+                    # "streams-aware": fora de urisourcebin/decodebin3 ele falha com
+                    # "Element requires a streams-aware context". Testado e revertido.
                     " ! hlsdemux ! tsdemux name=d"
                     " d. ! queue max-size-bytes=8388608 ! h264parse ! v4l2slh264dec"
                     " ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true"
+                    # max-lateness de fabrica e 5 ms: qualquer quadro que se
+                    # atrase mais que isso e DESCARTADO, e a TV fica segurando o
+                    # ultimo — parece travamento, e o log confirma ("A lot of
+                    # buffers are being dropped"). 200 ms de folga fazem o quadro
+                    # atrasado aparecer em vez de sumir; nao adiciona latencia
+                    # nenhuma, so decide o que fazer com quem ja chegou tarde.
+                    " max-lateness=200000000"
                     " d. ! queue max-size-bytes=8388608 max-size-time=0 max-size-buffers=0"
                     " ! aacparse ! avdec_aac"
                     " ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2"
-                    # sync=false SO no ao vivo: com sync=true o sink tenta casar cada
-                    # buffer com o relogio e realinha ~37x/s (medido: 1580 avisos em 40s),
-                    # e cada realinhamento e um micro-corte audivel. Sem sincronia: 0.
-                    # Aqui e seguro porque audio e video vem no MESMO MPEG-TS e o HLS
-                    # ja entrega em ritmo de tempo real.
-                    " ! alsasink device=hw:2 sync=false buffer-time=200000")
+                    # Ao vivo, o audio precisa de relogio — mas com tolerancia.
+                    # sync=false (o que estava aqui) tira o micro-corte do realinhamento
+                    # constante e cria um problema pior: o audio corre solto e, numa live
+                    # de uma hora, some do video. O certo e manter sync=true e afrouxar o
+                    # gatilho: alignment-threshold sai dos 40 ms de fabrica (que disparavam
+                    # ~37 realinhamentos por segundo — 1580 avisos em 40 s) para 200 ms, e
+                    # discont-wait segura 5 s antes de tratar um buraco como descontinuidade.
+                    " ! alsasink device=hw:2 sync=true buffer-time=200000"
+                    " alignment-threshold=200000000 discont-wait=5000000000")
         else:
             desc = (f'souphttpsrc location="{info["v"]}"'
                     " ! queue max-size-bytes=20971520 max-size-time=0 max-size-buffers=0"
                     " ! qtdemux ! h264parse ! v4l2slh264dec"
                     " ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true"
+                    # max-lateness de fabrica e 5 ms: qualquer quadro que se
+                    # atrase mais que isso e DESCARTADO, e a TV fica segurando o
+                    # ultimo — parece travamento, e o log confirma ("A lot of
+                    # buffers are being dropped"). 200 ms de folga fazem o quadro
+                    # atrasado aparecer em vez de sumir; nao adiciona latencia
+                    # nenhuma, so decide o que fazer com quem ja chegou tarde.
+                    " max-lateness=200000000"
                     + aud)
 
         self.pipe = Gst.parse_launch(desc)
@@ -164,8 +215,25 @@ class Player:
         bus.add_signal_watch()
         bus.connect("message::eos", lambda *_: self.proximo())
         bus.connect("message::error", self.ao_erro)
+        bus.connect("message::warning", self.ao_aviso)
         self.pipe.set_state(Gst.State.PLAYING)
         self.atual = info
+
+    def ao_aviso(self, _bus, msg):
+        """Conta os avisos do GStreamer, que e onde mora o diagnostico real.
+
+        Resync do audio e quadro descartado por atraso chegam como WARNING, nunca
+        como erro — sem isto, um travamento visivel nao deixa rastro nenhum no log.
+        Loga o 1o, o 10o e depois a cada 100 pra nao afogar o journal.
+        """
+        err, dbg = msg.parse_warning()
+        origem = msg.src.get_name() if msg.src else "?"
+        chave = f"{origem}: {err.message}"
+        n = self.avisos.get(chave, 0) + 1
+        self.avisos[chave] = n
+        if n in (1, 10) or n % 100 == 0:
+            print(f"aviso #{n} — {chave} | {(dbg or '').splitlines()[-1][:120]}",
+                  file=sys.stderr, flush=True)
 
     def ao_erro(self, _bus, msg):
         err, _ = msg.parse_error()
