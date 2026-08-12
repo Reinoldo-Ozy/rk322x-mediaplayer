@@ -50,6 +50,11 @@ ORIGENS = [("Uma tela inteira", "monitor"), ("Apenas uma janela", "janela")]
 # So faz sentido com uma janela: numa tela inteira o som e sempre o do sistema.
 SONS = [("Só do programa da janela", "janela"), ("Tudo que sai no computador", "sistema")]
 
+# Idem: esticar uma janela pra preencher a TV custa nitidez (medido: 96,75 contra 99,60
+# de VMAF, e 68 contra 88 nos piores quadros). Tela inteira sempre precisa ser reduzida.
+TAMANHOS = [("Tamanho real, com borda preta", "tamanho-real"),
+            ("Esticar até preencher a TV", "preencher")]
+
 # (rotulo, kbps) — taxas escolhidas por medicao de SSIM contra o original:
 #   8 Mbps -> ~0.985 | 20 Mbps -> 0.9983 | 30 Mbps -> 0.9994 (quase transparente)
 # O enlace da 95 Mbit/s e o box decodifica ate 40 Mbps a 60fps sem perder quadro.
@@ -215,6 +220,11 @@ class Janela(Adw.ApplicationWindow):
         self.combo.set_selected(PADRAO)
         g_esp.add(self.combo)
 
+        self.tamanho = Adw.ComboRow(title="Como mostrar na TV")
+        self.tamanho.set_model(Gtk.StringList.new([t[0] for t in TAMANHOS]))
+        self.tamanho.connect("notify::selected", self.ao_trocar_origem)
+        g_esp.add(self.tamanho)
+
         self.audio = Adw.SwitchRow(title="Enviar o som")
         self.audio.set_active(True)
         self.audio.connect("notify::active", self.ao_trocar_origem)
@@ -348,6 +358,11 @@ class Janela(Adw.ApplicationWindow):
         self.escolha.set_subtitle(f"Uma {alvo} já está memorizada"
                                   if os.path.exists(token_de(o))
                                   else f"Vai perguntar qual {alvo} usar")
+        self.tamanho.set_visible(o == "janela")
+        self.tamanho.set_subtitle(
+            "Mais nítido: os pixels da janela vão sem esticar"
+            if TAMANHOS[self.tamanho.get_selected()][1] == "tamanho-real" else
+            "Ocupa a TV inteira, ao custo de borrar um pouco o texto")
         self.som.set_visible(o == "janela" and self.audio.get_active())
         self.som.set_subtitle(
             "Abas de um mesmo navegador contam como um programa só"
@@ -361,6 +376,8 @@ class Janela(Adw.ApplicationWindow):
         o = self.origem_atual()
         cmd = [sys.executable, CAST, "--bitrate",
                str(QUALIDADES[self.combo.get_selected()][1]), "--source", o]
+        if o == "janela":
+            cmd += ["--escala", TAMANHOS[self.tamanho.get_selected()][1]]
         if not self.audio.get_active():
             cmd.append("--no-audio")
         elif o == "janela":

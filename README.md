@@ -150,6 +150,81 @@ Separation is **per process**: tabs and windows of the same browser share one au
 cannot be told apart. Rejection measured against a 1 kHz tone played by another program: 88.9 in
 the system mix versus 0.60 in the isolated capture, ~43 dB.
 
+#### Where mirroring quality actually comes from
+
+Every encoder knob was measured against the desktop captured **uncompressed**, running the whole
+path — scale, encode, decode, scale back — and scoring the result with VMAF. At 20 Mbps:
+
+| Setting | VMAF | Worst frame |
+|---|---|---|
+| Baseline (main profile) | 97.99 | 96.23 |
+| `target-usage=1` | 98.01 | 96.25 |
+| + `trellis=true` | 98.17 | 96.57 |
+| + `profile=high` | 98.20 | 96.61 |
+| + GOP 120 | **98.21** | 96.61 |
+| 30 Mbps instead of 20 | 98.30 | 97.05 |
+| 8 Mbps instead of 20 | 97.12 | 94.28 |
+
+All of it adds up to **+0.22 VMAF** — free, but nearly invisible. Raising the bitrate to 30 Mbps
+buys +0.10 for 50% more bandwidth. Geometry is where the quality actually goes:
+
+| Path | VMAF | Worst frame |
+|---|---|---|
+| Whole 1440p screen → 1080p TV | **76.08** | 33.88 |
+| 1280×720 window **stretched** to 1080p | 96.75 | 68.18 |
+| Same window sent **1:1**, black borders | **99.60** | 88.09 |
+
+Mirroring a screen larger than the TV throws away 44% of the pixels before the encoder ever sees
+them, and nothing recovers that. So a window that fits within the output is now sent unscaled and
+centred (`--escala tamanho-real`, the default; `--escala preencher` restores stretching). It uses
+`vacompositor`, so the frame is padded on the GPU and the zero-copy path is preserved: 60.01 fps,
+zero dropped frames, verified end to end.
+
+Two settings that look like free wins and are **not** — verified rather than assumed on Intel's
+VA driver: `scale-method=hq` produces output byte-identical to the default, and `cpb-size` does
+not change the keyframe burst (481 KB at every value from 20000 down to 2000).
+
+#### Refresh rate: 60 fps out of a 165 Hz display is not smooth
+
+A high-refresh monitor is the wrong clock to sample. At 165 Hz the compositor delivers frames
+12 ms and 18 ms apart (2 or 3 refreshes), and `videorate` has to force that onto a 16.67 ms grid:
+
+| Output cadence | 165 Hz source | 120 Hz source |
+|---|---|---|
+| Median interval | 18.00 ms | **16.67 ms** |
+| Standard deviation | 10.19 ms | **2.65 ms** |
+| Worst interval | 115 ms | 34 ms |
+| Frames duplicated to fill gaps | **96 of 713** | 0 |
+
+Nothing is *lost* — no counter anywhere reports a drop — but the motion judders in a steady
+rhythm. Set the mirrored display to a multiple of the target rate (120 Hz for 60 fps) and it goes
+away. Everything else — bigger buffers, higher bitrate, frame interpolation — treats the symptom.
+
+This is why serious mirroring systems never sample an existing display: Sunshine and GameStream
+create a virtual display at the client's exact mode, macOS renders a separate AirPlay stream, and
+Miracast simply mandates the allowed modes. A mirrored virtual output would be ideal here, and
+Hyprland can create one, but its portal only offers real outputs — so the practical fix is the
+display mode.
+
+#### One cast at a time, and recovering from a dead capture
+
+Two mirrors pointed at the same box put two H.264 streams on one RTP port; the decoder stops and
+the TV holds its last frame, while audio keeps playing — a freeze that looks nothing like its
+cause. `tv-cast.py` now takes an exclusive `flock` per destination and asks any previous cast to
+step aside (`SIGUSR1`, which exits without painting the "no signal" screen over the new stream).
+
+A watchdog checks every 2 s and rebuilds when the capture stops producing:
+
+- the source **resized** (moving a window to another monitor does this) — the pipeline never
+  recovers on its own, since the compositor pad is pinned to the old geometry;
+- a pipeline process **died**;
+- **nothing was sent for 10 s** — if rebuilding the pipeline does not help, the portal session
+  itself is gone (its service restarted, say) and a new one is requested; the saved token means
+  no dialog appears.
+
+Children are started with `PR_SET_PDEATHSIG`, so a `kill -9` on the cast cannot leave an orphaned
+ffmpeg streaming audio to the TV forever.
+
 ### `box/` — the TV box
 
 | File | Purpose |
@@ -257,6 +332,8 @@ one, since anything with those cookies acts as that account.
 | **HEVC** | ⚠️ Decodes, but slower than H.264 here (36 vs 89 fps at 720p). Not worth choosing. |
 | **A browser on the box** | ❌ A browser cannot reach the VPU and falls back to software decode. Software decode of 1080p manages 27 fps on a desktop i5 — roughly 10× faster per core than this A7. |
 | **Thermals** | ⚠️ 80 °C observed on a long 1080p60 live stream, with no heatsink. Throttling starts near 90 °C. |
+| **Mirroring a high-refresh display** | ⚠️ A source whose refresh is not a multiple of 60 judders no matter what. Set the mirrored output to 120 Hz (or 60). |
+| **Late frames** | ⚠️ `kmssink` drops buffers it considers late (`A lot of buffers are being dropped` in its log) instead of showing them behind schedule, which reads as a freeze. Giving it a `max-lateness` allowance is untested. |
 
 ---
 
