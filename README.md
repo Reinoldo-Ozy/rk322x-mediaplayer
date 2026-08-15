@@ -233,12 +233,45 @@ ffmpeg streaming audio to the TV forever.
 | `tv-web` | Web remote on port 8080 — paste a link and control playback from a phone, with no desktop involved |
 | `tv-receiver` | Receives mirrored video (RTP H.264) |
 | `tv-receiver-audio` | Receives mirrored audio (RTP L16) |
+| `tv-remote` | Infrared remote: reads the IR receiver and drives the player |
+| `tv-remote-test` | Diagnostic page on port 8081: tests a remote and **learns** its codes |
 | `rk322x-dmc.service` | Enables memory frequency scaling (see below) |
 | `instalar.sh` | Installs all of the above |
 
 ```bash
 sudo ./box/instalar.sh
 ```
+
+#### The infrared remote the box already has
+
+These boxes ship with an IR receiver wired to a GPIO, and mainline Linux drives
+it out of the box: `gpio_ir_recv` is loaded, `/dev/lirc0` exists, and the NEC
+decoder is enabled. What is missing is the mapping — and that is where it goes
+wrong quietly.
+
+**The kernel's own keymap probably does not fit your remote.** `rc-rk322x-tvbox`
+is built for remotes using NEC address `0x4040`. The unit tested here uses
+`0x01`. The symptom is not an error: the scancodes arrive as `EV_MSC` events and
+**no key is ever produced**, so everything looks connected and nothing works.
+
+Capture your own with the learning mode of `tv-remote-test` (port 8081): it asks
+for one button at a time, requires each twice, and writes the finished TOML.
+Deriving the map from a batch capture is a trap — one button that fails to
+register shifts every code after it, silently, and the arithmetic regularity of
+a numeric keypad is convincing enough to make you trust a wrong result.
+
+⚠️ **Never map `0x1ff`.** Remotes with a TV section speak the TV's protocol on
+those keys; the signal still reaches the box, the NEC decoder cannot parse it and
+emits `0x1ff` — command `0xff`, all bits set, the signature of a corrupted
+decode. Leaving it unmapped is what stops the TV volume keys from firing
+commands at the player.
+
+⚠️ **`HandlePowerKey=ignore` is mandatory.** Once `KEY_POWER` is mapped,
+`systemd-logind` will happily power the box off when you press it on the remote.
+`instalar.sh` writes the drop-in.
+
+The service also opens an external UI on `KEY_HOME`, if `TV_UI` points at one.
+That integration is optional and inert when unset — the remote works on its own.
 
 #### A frozen picture is usually a dropped frame
 

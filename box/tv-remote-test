@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Pagina de teste do controle infravermelho -- estilo teste de controle.
+
+Serve em :8081 um desenho do controle que acende o botao apertado, conta os
+toques e mostra o comando JSON que o tv-remote mandaria para o player. Serve
+para responder "o controle esta indo?" sem precisar de video tocando nem de
+ler log por SSH.
+
+Le o mesmo /dev/input/eventN que o tv-remote: o evdev entrega uma copia de
+cada evento para cada leitor aberto, entao os dois convivem sem roubar tecla
+um do outro. Esta pagina nao manda nada para o player -- so observa.
+
+Diagnostico, nao servico de boot: iniciar sob demanda com
+  systemctl start tv-remote-test
+"""
+
+import json
+import os
+import queue
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import evdev
+
+NOME_DISPOSITIVO = os.environ.get("TV_REMOTE_INPUT", "gpio_ir_recv")
+PORTA = int(os.environ.get("TV_REMOTE_TEST_PORT", "8081"))
+
+# Mesma tabela do tv-remote, so para exibir o que aconteceria.
+COMANDOS = {
+    "KEY_ENTER": '{"cmd":"toggle"}',
+    "KEY_LEFT": '{"cmd":"prev"}',
+    "KEY_RIGHT": '{"cmd":"next"}',
+    "KEY_UP": '{"cmd":"skip","delta":30}',
+    "KEY_DOWN": '{"cmd":"skip","delta":-10}',
+    "KEY_BACK": '{"cmd":"stop"}',
+    "KEY_HOME": '{"cmd":"status"}',
+    "KEY_MENU": '{"cmd":"status"}',
+    "KEY_POWER": '{"cmd":"stop"} + CEC standby',
+    # Mapeadas como tecla, ainda sem acao no tv-remote. Volume precisaria de um
+    # elemento volume no pipeline do player: a placa HDMI desta box nao tem
+    # controle de mixer nenhum (so ELD, IEC958 e channel map), entao nao existe
+    # volume por hardware para o amixer mexer.
+    "KEY_VOLUMEUP": "(sem acao -- HDMI sem mixer)",
+    "KEY_VOLUMEDOWN": "(sem acao -- HDMI sem mixer)",
+    "KEY_MUTE": "(sem acao -- HDMI sem mixer)",
+    "KEY_SETUP": "(mapeada, sem acao)",
+    "KEY_BACKSPACE": "(mapeada, sem acao)",
+    "KEY_PROG1": "(app -- mapeada, sem acao)",
+    "KEY_PROG2": "(mouse -- mapeada, sem acao)",
+}
+for _n in range(10):
+    COMANDOS[f"KEY_{_n}"] = "(digito -- sem acao; ver fila por indice)"
+
+assinantes = set()
+trava = threading.Lock()
+
+
+def publicar(evento):
+    dados = json.dumps(evento)
+    with trava:
+        mortos = []
+        for q in assinantes:
+            try:
+                q.put_nowait(dados)
+            except queue.Full:
+                mortos.append(q)
+        for q in mortos:
+            assinantes.discard(q)
+
+
+def achar_dispositivo():
+    for caminho in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(caminho)
+        except OSError:
+            continue
+        if d.name == NOME_DISPOSITIVO:
+            return d
+        d.close()
+    return None
+
+
+def leitor():
+    """Le o receptor IR e publica cada tecla para os navegadores conectados."""
+    while True:
+        dev = achar_dispositivo()
+        if dev is None:
+            publicar({"tipo": "aviso", "texto": f"receptor '{NOME_DISPOSITIVO}' nao encontrado"})
+            time.sleep(5)
+            continue
+        publicar({"tipo": "pronto", "texto": f"{dev.path} ({dev.name})"})
+        try:
+            for ev in dev.read_loop():
+                # MSC_SCAN traz o scancode cru mesmo para botao SEM mapeamento --
+                # e o que permite o modo de aprendizado descobrir codigos novos.
+                if ev.type == evdev.ecodes.EV_MSC and ev.code == evdev.ecodes.MSC_SCAN:
+                    publicar({"tipo": "scan", "codigo": f"0x{ev.value:x}", "t": time.time()})
+                    continue
+                if ev.type != evdev.ecodes.EV_KEY or ev.value == 0:
+                    continue
+                tecla = evdev.ecodes.KEY.get(ev.code)
+                if isinstance(tecla, list):
+                    tecla = tecla[0]
+                if tecla is None:
+                    tecla = f"COD_{ev.code}"
+                publicar({
+                    "tipo": "tecla",
+                    "tecla": tecla,
+                    "repeticao": ev.value == 2,
+                    "comando": COMANDOS.get(tecla, "(sem mapeamento)"),
+                    "t": time.time(),
+                })
+        except OSError as e:
+            publicar({"tipo": "aviso", "texto": f"leitura interrompida: {e}"})
+        finally:
+            try:
+                dev.close()
+            except OSError:
+                pass
+        time.sleep(2)
+
+
+# String CRUA de proposito: o JavaScript aqui dentro usa \n em strings dele
+# (para montar o TOML). Numa string Python normal o \n vira quebra de linha
+# real e parte o literal JS ao meio -- o navegador acusa "Invalid or
+# unexpected token" e o script inteiro nao carrega.
+PAGINA = r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Teste do controle</title>
+<style>
+:root{
+  --fundo:#f4f5f7; --carta:#fff; --tinta:#1a1c1f; --fraco:#666d78;
+  --borda:#d8dce2; --aceso:#1f9d55; --aceso-luz:#d8f3e3; --rep:#c8912a;
+}
+@media (prefers-color-scheme:dark){:root{
+  --fundo:#14161a; --carta:#1d2026; --tinta:#e8eaed; --fraco:#9aa3af;
+  --borda:#2e333c; --aceso:#35c47c; --aceso-luz:#123626; --rep:#d9a441;
+}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--fundo);color:var(--tinta);
+  font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.env{max-width:760px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--fraco);margin:0 0 20px;font-size:14px}
+.status{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;
+  border:1px solid var(--borda);border-radius:999px;background:var(--carta);
+  font-size:13px;margin-bottom:20px}
+.ponto{width:8px;height:8px;border-radius:50%;background:var(--fraco)}
+.ponto.ok{background:var(--aceso)}
+.grade{display:grid;grid-template-columns:minmax(240px,1fr) minmax(240px,1.2fr);
+  gap:20px;align-items:start}
+@media(max-width:640px){.grade{grid-template-columns:1fr}}
+.carta{background:var(--carta);border:1px solid var(--borda);border-radius:12px;padding:18px}
+.controle{display:grid;grid-template-columns:repeat(3,64px);gap:10px;justify-content:center}
+.b{height:52px;display:flex;align-items:center;justify-content:center;
+  border:1px solid var(--borda);border-radius:10px;background:var(--fundo);
+  font-size:12px;font-weight:600;color:var(--fraco);
+  transition:background .08s,color .08s,border-color .08s,transform .08s}
+.b.on{background:var(--aceso-luz);border-color:var(--aceso);color:var(--aceso);
+  transform:scale(.94)}
+.b.rep{border-color:var(--rep);color:var(--rep)}
+.b.ok{border-radius:50%}
+.vazio{border:none;background:none}
+.n{position:absolute;font-size:10px}
+.cel{position:relative}
+.cnt{position:absolute;top:2px;right:6px;font-size:10px;color:var(--fraco);font-weight:400}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--borda)}
+th{color:var(--fraco);font-weight:600;font-size:12px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.log{max-height:230px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px}
+.log div{padding:2px 0;border-bottom:1px solid var(--borda)}
+.marca{color:var(--rep)}
+button{font:inherit;padding:7px 14px;border-radius:8px;
+  border:1px solid var(--borda);background:var(--carta);color:var(--tinta);cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button:hover:not(:disabled){border-color:var(--aceso);color:var(--aceso)}
+</style></head><body><div class="env">
+<h1>Teste do controle</h1>
+<p class="sub">Aperte os botoes mirando na box. O botao acende aqui quando o
+evento chega -- se nao acender, o sinal nao chegou ao receptor.</p>
+<div class="status"><span class="ponto" id="ponto"></span><span id="conexao">conectando...</span></div>
+<div class="grade">
+  <div class="carta"><div class="controle" id="controle"></div></div>
+  <div class="carta">
+    <table><thead><tr><th>Ultima tecla</th><th>Comando que seria enviado</th></tr></thead>
+    <tbody><tr><td id="ultima">--</td><td><code id="comando">--</code></td></tr></tbody></table>
+    <p class="sub" style="margin:14px 0 6px">Historico</p>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<div class="carta" style="margin-top:20px">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div>
+      <strong>Modo aprendizado</strong>
+      <p class="sub" style="margin:2px 0 0">Pergunta botao por botao e le o codigo cru --
+      funciona mesmo para tecla ainda sem mapeamento. Nao depende de ordem.</p>
+    </div>
+    <div>
+      <button id="btAprender">Comecar</button>
+      <button id="btPular" disabled>Pular este</button>
+      <button id="btAbortar" disabled>Parar</button>
+    </div>
+  </div>
+  <div id="painelAprender" style="display:none;margin-top:16px">
+    <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+      <span class="sub" id="progresso"></span>
+      <span style="font-size:22px;font-weight:700" id="alvo"></span>
+      <span id="capturado" style="font-family:ui-monospace,monospace"></span>
+    </div>
+    <textarea id="saida" style="display:none;width:100%;height:260px;margin-top:14px;
+      font-family:ui-monospace,monospace;font-size:12px;background:var(--fundo);
+      color:var(--tinta);border:1px solid var(--borda);border-radius:8px;padding:10px"></textarea>
+  </div>
+</div>
+</div>
+<script>
+const LAYOUT=[
+ ["KEY_POWER","KEY_MUTE","KEY_SETUP"],
+ ["KEY_1","KEY_2","KEY_3"],
+ ["KEY_4","KEY_5","KEY_6"],
+ ["KEY_7","KEY_8","KEY_9"],
+ ["KEY_BACKSPACE","KEY_0","KEY_PROG2"],
+ ["KEY_HOME","KEY_UP","KEY_MENU"],
+ ["KEY_LEFT","KEY_ENTER","KEY_RIGHT"],
+ ["KEY_VOLUMEDOWN","KEY_DOWN","KEY_VOLUMEUP"],
+ ["","KEY_BACK","KEY_PROG1"]];
+const ROTULO={KEY_POWER:"POWER",KEY_HOME:"HOME",KEY_MENU:"MENU",KEY_UP:"CIMA",
+ KEY_LEFT:"ESQ",KEY_ENTER:"OK",KEY_RIGHT:"DIR",KEY_DOWN:"BAIXO",KEY_BACK:"VOLTAR",
+ KEY_MUTE:"MUDO",KEY_VOLUMEDOWN:"VOL-",KEY_VOLUMEUP:"VOL+",KEY_SETUP:"SETUP",
+ KEY_BACKSPACE:"APAGAR",KEY_PROG2:"MOUSE",KEY_PROG1:"APP",
+ KEY_0:"0",KEY_1:"1",KEY_2:"2",KEY_3:"3",KEY_4:"4",KEY_5:"5",KEY_6:"6",
+ KEY_7:"7",KEY_8:"8",KEY_9:"9"};
+const cont={},elem={};
+const grade=document.getElementById("controle");
+for(const linha of LAYOUT)for(const k of linha){
+  const cel=document.createElement("div");cel.className="cel";
+  if(!k){cel.className+=" vazio";grade.appendChild(cel);continue}
+  const b=document.createElement("div");
+  b.className="b"+(k==="KEY_ENTER"?" ok":"");b.textContent=ROTULO[k];
+  const c=document.createElement("span");c.className="cnt";c.textContent="";
+  cel.appendChild(b);cel.appendChild(c);grade.appendChild(cel);
+  elem[k]={b:b,c:c};cont[k]=0;
+}
+function acender(k,rep){
+  const e=elem[k];if(!e)return;
+  e.b.classList.add("on");if(rep)e.b.classList.add("rep");
+  clearTimeout(e.t);e.t=setTimeout(()=>{e.b.classList.remove("on","rep")},180);
+  cont[k]++;e.c.textContent=cont[k];
+}
+function registrar(txt,marca){
+  const d=document.createElement("div");d.textContent=txt;
+  if(marca)d.className="marca";
+  const l=document.getElementById("log");l.prepend(d);
+  while(l.children.length>60)l.lastChild.remove();
+}
+const fonte=new EventSource("/eventos");
+fonte.onopen=()=>{document.getElementById("ponto").className="ponto ok";
+  document.getElementById("conexao").textContent="conectado";};
+fonte.onerror=()=>{document.getElementById("ponto").className="ponto";
+  document.getElementById("conexao").textContent="desconectado -- tentando de novo";};
+// ---- modo aprendizado -------------------------------------------------
+// Pergunta um botao por vez e aceita o codigo so depois de ve-lo duas vezes,
+// para nao gravar um quadro NEC corrompido (o 0x1ff dos botoes de TV, por
+// exemplo) nem o eco de um botao anterior.
+const ALVOS=[
+ ["KEY_ENTER","OK"],["KEY_UP","seta CIMA"],["KEY_DOWN","seta BAIXO"],
+ ["KEY_LEFT","seta ESQUERDA"],["KEY_RIGHT","seta DIREITA"],
+ ["KEY_BACK","VOLTAR"],["KEY_HOME","HOME"],["KEY_MENU","MENU"],
+ ["KEY_POWER","POWER (da box)"],
+ ["KEY_MUTE","MUDO"],["KEY_VOLUMEDOWN","VOL- (da box)"],["KEY_VOLUMEUP","VOL+ (da box)"],
+ ["KEY_0","digito 0"],["KEY_1","digito 1"],["KEY_2","digito 2"],["KEY_3","digito 3"],
+ ["KEY_4","digito 4"],["KEY_5","digito 5"],["KEY_6","digito 6"],["KEY_7","digito 7"],
+ ["KEY_8","digito 8"],["KEY_9","digito 9"],
+ ["KEY_BACKSPACE","APAGAR"],["KEY_PROG2","MOUSE"],["KEY_SETUP","SETUP"],["KEY_PROG1","APP"]];
+let apr=null;
+const $=(id)=>document.getElementById(id);
+
+function mostrarAlvo(){
+  $("progresso").textContent=`${apr.i+1} de ${ALVOS.length}`;
+  $("alvo").textContent="Aperte: "+ALVOS[apr.i][1];
+  $("capturado").textContent="";
+  apr.visto=null;apr.n=0;
+}
+function terminar(){
+  $("alvo").textContent="Pronto.";
+  $("progresso").textContent=`${Object.keys(apr.mapa).length} teclas capturadas`;
+  $("capturado").textContent="";
+  let t="# Gerado pelo modo aprendizado do tv-remote-test.\n";
+  t+="# NAO mapeie 0x1ff: e o lixo que os botoes da secao de TV produzem.\n\n";
+  t+='[[protocols]]\nname = "rk322x_reinoldo"\nprotocol = "nec"\n\n[protocols.scancodes]\n';
+  for(const [k,rot] of ALVOS){ if(apr.mapa[k]) t+=`${apr.mapa[k]} = "${k}"\n`; }
+  const s=$("saida");s.style.display="block";s.value=t;s.select();
+  $("btPular").disabled=true;$("btAbortar").disabled=true;$("btAprender").disabled=false;
+  apr.ativo=false;
+}
+function avancar(){
+  apr.i++;
+  if(apr.i>=ALVOS.length){terminar();return;}
+  mostrarAlvo();
+}
+$("btAprender").onclick=()=>{
+  apr={ativo:true,i:0,mapa:{},visto:null,n:0,usados:new Set()};
+  $("painelAprender").style.display="block";$("saida").style.display="none";
+  $("btPular").disabled=false;$("btAbortar").disabled=false;$("btAprender").disabled=true;
+  mostrarAlvo();
+};
+$("btPular").onclick=()=>{if(apr&&apr.ativo)avancar();};
+$("btAbortar").onclick=()=>{if(apr)terminar();};
+
+function aprenderScan(cod){
+  if(cod==="0x1ff"){
+    $("capturado").innerHTML='<span class="marca">0x1ff -- botao da secao de TV, ignorado</span>';
+    return;
+  }
+  if(apr.usados.has(cod)){
+    $("capturado").innerHTML='<span class="marca">'+cod+' ja usado em outra tecla</span>';
+    return;
+  }
+  if(cod===apr.visto){apr.n++;}else{apr.visto=cod;apr.n=1;}
+  $("capturado").textContent=cod+(apr.n<2?"  (aperte de novo para confirmar)":"  confirmado");
+  if(apr.n>=2){
+    apr.mapa[ALVOS[apr.i][0]]=cod;apr.usados.add(cod);
+    registrar("aprendido: "+ALVOS[apr.i][0]+" = "+cod);
+    setTimeout(avancar,400);
+  }
+}
+
+fonte.onmessage=(ev)=>{
+  const m=JSON.parse(ev.data);
+  if(m.tipo==="scan"){
+    if(apr&&apr.ativo)aprenderScan(m.codigo);
+    return;
+  }
+  if(m.tipo==="tecla"){
+    acender(m.tecla,m.repeticao);
+    document.getElementById("ultima").textContent=m.tecla+(m.repeticao?" (repeticao)":"");
+    document.getElementById("comando").textContent=m.comando;
+    const h=new Date(m.t*1000).toLocaleTimeString("pt-BR");
+    registrar(h+"  "+m.tecla+(m.repeticao?"  [rep]":""),m.repeticao);
+  } else {
+    registrar("* "+m.texto,true);
+  }
+};
+</script></body></html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/eventos"):
+            return self.sse()
+        corpo = PAGINA.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.end_headers()
+        self.wfile.write(corpo)
+
+    def sse(self):
+        q = queue.Queue(maxsize=200)
+        with trava:
+            assinantes.add(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while True:
+                try:
+                    dados = q.get(timeout=15)
+                    self.wfile.write(f"data: {dados}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")  # segura a conexao viva
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with trava:
+                assinantes.discard(q)
+
+
+def main():
+    threading.Thread(target=leitor, daemon=True).start()
+    srv = ThreadingHTTPServer(("0.0.0.0", PORTA), Handler)
+    srv.daemon_threads = True
+    print(f"teste do controle em http://0.0.0.0:{PORTA}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

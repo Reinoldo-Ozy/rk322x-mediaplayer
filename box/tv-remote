@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Traduz as teclas do controle infravermelho em comandos do tv-player.
+
+O receptor IR da box (gpio_ir_recv) entrega teclas ja decodificadas em
+/dev/input/eventN, desde que o keymap certo esteja carregado -- ver
+/etc/rc_keymaps/rk322x-reinoldo.toml e a entrada em /etc/rc_maps.cfg.
+Este servico so le essas teclas e fala o protocolo JSON/TCP da porta 5010,
+igual ao tv-web faz. Nada aqui toca no caminho de video.
+
+KEY_HOME abre, opcionalmente, uma interface grafica externa (variavel TV_UI).
+A integracao e desacoplada de proposito: este servico nao depende de nenhum app
+especifico e funciona sozinho se TV_UI nao estiver definida.
+
+Por que evdev e nao ler /dev/input/eventN na mao: o armhf do Debian 13 usa
+time_t de 64 bits, entao a struct input_event tem 24 bytes e nao os 16 de
+sempre. Parsear com o formato errado nao da erro, da lixo silencioso.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+import evdev
+
+NOME_DISPOSITIVO = os.environ.get("TV_REMOTE_INPUT", "gpio_ir_recv")
+HOST = os.environ.get("TV_PLAYER_HOST", "127.0.0.1")
+PORTA = int(os.environ.get("TV_PLAYER_PORT", "5010"))
+CEC = os.environ.get("TV_CEC_DEV", "/dev/cec0")
+# Integracao OPCIONAL com uma interface grafica externa (um app de TV, por
+# exemplo). Vazio = KEY_HOME nao faz nada. Definir no .service:
+#   Environment=TV_UI=/caminho/para/o/app.py
+UI = os.environ.get("TV_UI", "")
+
+# Um toque no controle costuma gerar de dois a tres key_down (o NEC repete o
+# quadro e o botao repica). Sem isto, uma apertada de "next" pula tres faixas.
+DEBOUNCE_S = 0.35
+
+# Repeticao continua so faz sentido onde o efeito e incremental.
+PERMITE_REPETICAO = {"KEY_UP", "KEY_DOWN"}
+
+# Mapa das teclas. Mudar aqui e a unica coisa necessaria para remapear.
+# Observacao: pular dentro do video NAO funciona nos formatos 1080p do
+# YouTube (MP4 fragmentado, o qtdemux nao busca). O player responde com erro
+# e este servico apenas registra -- as teclas de fila sempre funcionam.
+MAPA = {
+    "KEY_ENTER": {"cmd": "toggle"},
+    "KEY_LEFT": {"cmd": "prev"},
+    "KEY_RIGHT": {"cmd": "next"},
+    "KEY_UP": {"cmd": "skip", "delta": 30},
+    "KEY_DOWN": {"cmd": "skip", "delta": -10},
+    "KEY_BACK": {"cmd": "stop"},
+    # HOME abre a interface -- e o botao de "entrar no YouTube".
+    "KEY_HOME": {"acao": "abrir_ui"},
+    "KEY_MENU": {"cmd": "status"},
+    "KEY_POWER": {"cmd": "stop"},  # e mais o standby por CEC, abaixo
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def falar_com_player(payload):
+    """Manda uma linha JSON para o tv-player e devolve a resposta."""
+    try:
+        with socket.create_connection((HOST, PORTA), timeout=4) as s:
+            s.sendall((json.dumps(payload) + "\n").encode())
+            resposta = s.makefile().readline()
+        return json.loads(resposta or "{}")
+    except (OSError, ValueError) as e:
+        log(f"player nao respondeu ({payload.get('cmd')}): {e}")
+        return None
+
+
+def ui_rodando():
+    """Procura o processo da interface lendo /proc direto.
+
+    De proposito sem pgrep: alem de evitar um processo externo, escapa da
+    armadilha de o padrao casar com a propria linha de comando de quem procura.
+    """
+    alvo = os.path.basename(UI).encode()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                if alvo in f.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def abrir_ui():
+    """Sobe a interface, se ainda nao estiver de pe.
+
+    start_new_session desacopla do systemd deste servico: a interface sobrevive
+    a um restart do tv-remote, e um crash dela nao derruba o controle.
+    """
+    if not UI:
+        log("KEY_HOME: nenhuma interface configurada (defina TV_UI)")
+        return
+    if ui_rodando():
+        log("interface ja esta aberta")
+        return
+    if not os.path.exists(UI):
+        log(f"interface nao encontrada em {UI}")
+        return
+    try:
+        with open("/tmp/tv-ui.log", "ab") as saida:
+            subprocess.Popen([sys.executable, UI], stdout=saida, stderr=saida,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        log("interface aberta")
+    except OSError as e:
+        log(f"nao consegui abrir a interface: {e}")
+
+
+def desligar_tv_por_cec():
+    """Best-effort: manda Standby para a TV.
+
+    A TV TCL testada aqui NAO obedece -- verificado um a um: Standby nao
+    desliga, Image View On e Active Source nao trocam a entrada, e ela nunca
+    encaminha tecla do proprio controle. Responde consultas (versao, idioma,
+    power status) em 26-39 ms e aceita tudo sem Feature Abort; so ignora. E o
+    "T-Link" dela (nome do HDMI-CEC na TCL) estava LIGADO, entao nao adianta
+    procurar configuracao. Fica porque nao custa nada e funciona em TV com
+    CEC completo.
+    """
+    if not os.path.exists(CEC):
+        return
+    try:
+        subprocess.run(
+            ["cec-ctl", "-d", CEC, "--to", "0", "--standby"],
+            capture_output=True, timeout=6,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"cec standby falhou: {e}")
+
+
+def achar_dispositivo():
+    """Procura o receptor IR pelo nome; o numero de /dev/input/eventN varia."""
+    for caminho in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(caminho)
+        except OSError:
+            continue
+        if d.name == NOME_DISPOSITIVO:
+            return d
+        d.close()
+    return None
+
+
+def tratar(tecla):
+    payload = MAPA.get(tecla)
+    if payload is None:
+        return
+    if payload.get("acao") == "abrir_ui":
+        abrir_ui()
+        return
+    resposta = falar_com_player(dict(payload))
+    if resposta is not None and resposta.get("erro"):
+        log(f"{tecla} -> {payload['cmd']}: {resposta['erro']}")
+    else:
+        log(f"{tecla} -> {payload['cmd']}")
+    if tecla == "KEY_POWER":
+        desligar_tv_por_cec()
+
+
+def laco(dev):
+    ultimo = {}
+    for ev in dev.read_loop():
+        if ev.type != evdev.ecodes.EV_KEY:
+            continue
+        # 1 = apertou, 2 = repeticao automatica, 0 = soltou
+        if ev.value == 0:
+            continue
+        tecla = evdev.ecodes.KEY.get(ev.code)
+        if isinstance(tecla, list):
+            tecla = tecla[0]
+        if tecla is None:
+            continue
+        if ev.value == 2 and tecla not in PERMITE_REPETICAO:
+            continue
+        agora = time.monotonic()
+        if agora - ultimo.get(tecla, 0.0) < DEBOUNCE_S:
+            continue
+        ultimo[tecla] = agora
+        tratar(tecla)
+
+
+def main():
+    while True:
+        dev = achar_dispositivo()
+        if dev is None:
+            log(f"receptor '{NOME_DISPOSITIVO}' nao encontrado; tentando de novo")
+            time.sleep(5)
+            continue
+        log(f"lendo {dev.path} ({dev.name}); player em {HOST}:{PORTA}")
+        try:
+            laco(dev)
+        except OSError as e:
+            log(f"leitura interrompida: {e}")
+        finally:
+            try:
+                dev.close()
+            except OSError:
+                pass
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -259,7 +259,7 @@ gst-launch-1.0 -v filesrc location=X.mp4 ! qtdemux ! h264parse ! v4l2slh264dec \
 Tudo nas seções acima foi medido tocando **arquivo local**. O que faltava era transformar isso em
 algo usável no dia a dia — e isso está pronto:
 
-- **Receptor de rede** — três serviços systemd sobem no boot: `tv-player` (controle por JSON/TCP na 5010), `tv-receiver` (vídeo RTP H.264 na 5004) e `tv-receiver-audio` (áudio RTP L16 na 5006). Espelhando 1080p60: 60,0 fps, zero perdas, ~56 ms de vídeo e ~60 ms de áudio.
+- **Receptor de rede** — cinco serviços systemd sobem no boot: `tv-player` (controle por JSON/TCP na 5010), `tv-web` (página do celular na 8080), `tv-receiver` (vídeo RTP H.264 na 5004), `tv-receiver-audio` (áudio RTP L16 na 5006) e `tv-remote` (controle infravermelho). Espelhando 1080p60: 60,0 fps, zero perdas, ~56 ms de vídeo e ~60 ms de áudio.
 - **Áudio HDMI** — funciona. O `HDMI: Unknown ELD version 0` do log é ruído: a TV não devolve um ELD que o driver reconheça, o que não impede a saída. Espelhando, dá pra mandar **só o som da janela capturada** em vez da mistura do sistema inteiro (o porquê e como está no README).
 - **IP fixo** — `192.168.10.159` fixado no NetworkManager da própria box, não mais por sorte do DHCP.
 - **Publicar a correção** — o repositório `rk322x-mediaplayer` já está reescrito em cima do resultado certo.
@@ -269,8 +269,8 @@ algo usável no dia a dia — e isso está pronto:
 ## 10. O que continua em aberto
 
 - **Post no fórum Armbian** (tópico 34923) — redigido, ainda não publicado. É onde a correção do "720p" alcançaria quem procura pelo assunto.
-- **Página de controle pelo celular** — existe e roda na box (`tv-web`, `:8080`, dispensa o PC), mas ainda não foi publicada neste repositório.
-- **Controle único por CEC ou IR** — `/dev/cec0` e `/dev/lirc0` existem e nada foi montado em cima deles. Hoje o controle é pelo PC ou pelo celular.
+- **Controle infravermelho — FEITO.** O serviço `tv-remote` lê o receptor da box e comanda o player. O keymap embutido do kernel (`rc-rk322x-tvbox`) **não serve** para todo controle: ele espera endereço NEC `0x4040` e o desta unidade usa `0x01` — os códigos chegam e nenhuma tecla é gerada, sem erro nenhum. Capture o seu com o modo aprendizado do `tv-remote-test` (`:8081`). Ver o README para as duas armadilhas que quebram o sistema: nunca mapear `0x1ff` (é lixo de decodificação dos botões de TV) e `HandlePowerKey=ignore` (sem ele, POWER desliga a box).
+- **CEC — descartado nesta TV, medido.** Com o "T-Link" (nome do HDMI-CEC na TCL) **ligado**, a TV responde consultas em 26–39 ms mas ignora `Standby`, `Image View On` e `Active Source`, e nunca encaminha tecla do próprio controle. Aceita tudo sem `Feature Abort` e não obedece. Não é configuração: é a implementação dela. O IR resolve o que o CEC não resolveu.
 - **Buscar dentro do vídeo em 1080p** — o formato que o YouTube entrega nessa qualidade é MP4 fragmentado e o `qtdemux` não busca nele. Pausa, fila e próximo/anterior funcionam.
 - **`yt-dlp` é manutenção perpétua** — o YouTube quebra versões antigas com frequência, e os cookies da conta descartável expiram. Os dois sintomas se parecem: só formatos de storyboard aparecem.
 - **Dissipador** — 80 °C numa live longa de 1080p60, sem nada colado no chip. O throttling começa perto dos 90 °C.

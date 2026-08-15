@@ -1,0 +1,12 @@
+[Unit]
+Description=Pagina de teste do controle infravermelho (diagnostico, porta 8081)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tv-remote-test
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

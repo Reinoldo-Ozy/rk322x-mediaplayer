@@ -1,0 +1,16 @@
+[Unit]
+Description=Controle infravermelho para o tv-player
+After=multi-user.target tv-player.service
+Wants=tv-player.service
+
+[Service]
+Type=simple
+# Opcional: KEY_HOME abre esta interface grafica. Sem a variavel, KEY_HOME nao
+# faz nada e o controle segue funcionando normalmente.
+#Environment=TV_UI=/caminho/para/o/app.py
+ExecStart=/usr/local/bin/tv-remote
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

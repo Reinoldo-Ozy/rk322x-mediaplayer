@@ -1,0 +1,61 @@
+# Controle original da TV box RK322x (unidade do Reinoldo), 26 teclas.
+#
+# O keymap embutido no kernel (rc-rk322x-tvbox) usa endereco NEC 0x4040 e NAO
+# serve para este controle, que usa endereco 0x01: os codigos chegam, nenhum
+# casa, e so saem eventos EV_MSC sem tecla nenhuma. Capturado com
+# `ir-keytable -t`, cada botao apertado 3x com pausa entre eles.
+#
+# Os digitos seguem o layout fisico na numeracao: 1-4-7 descem de 4 em 4
+# (0x14e, 0x14a, 0x146) e os pares 2-3, 5-6, 8-9 mantem o mesmo passo com os
+# membros adjacentes. CUIDADO: essa regularidade tenta a gente a deduzir o
+# resto, e deduzir errou aqui -- o 0 nao e 0x141 (esse e o MUDO), e sim 0x101.
+# Este arquivo veio do modo aprendizado do tv-remote-test, que pergunta botao
+# por botao, e nao de inferencia por ordem de captura.
+#
+# ATENCAO -- NAO mapeie 0x1ff.
+# Este controle tem duas secoes: uma para a box (NEC, endereco 0x01) e outra
+# para a TV (protocolo do fabricante da TV). Os botoes da secao de TV -- volume
+# da TV, liga/desliga da TV, TV IN -- tambem alcancam o sensor da box, mas o
+# decodificador NEC nao entende e produz 0x1ff (comando 0xff, todos os bits em
+# 1, a assinatura tipica de decodificacao corrompida). Deixar 0x1ff sem
+# mapeamento e o que impede que mexer no volume da TV dispare comando no
+# player. Verificado em 2026-08-15.
+
+[[protocols]]
+name = "rk322x_reinoldo"
+protocol = "nec"
+
+[protocols.scancodes]
+# navegacao e transporte
+0x113 = "KEY_ENTER"
+0x116 = "KEY_UP"
+0x11a = "KEY_DOWN"
+0x151 = "KEY_LEFT"
+0x150 = "KEY_RIGHT"
+0x119 = "KEY_BACK"
+0x111 = "KEY_HOME"
+0x14c = "KEY_MENU"
+0x140 = "KEY_POWER"
+
+# volume da box (o par da TV nao chega decodificavel; ver aviso acima)
+0x110 = "KEY_VOLUMEDOWN"
+0x118 = "KEY_VOLUMEUP"
+0x141 = "KEY_MUTE"
+
+# teclado numerico
+0x101 = "KEY_0"
+0x14e = "KEY_1"
+0x10d = "KEY_2"
+0x10c = "KEY_3"
+0x14a = "KEY_4"
+0x109 = "KEY_5"
+0x108 = "KEY_6"
+0x146 = "KEY_7"
+0x105 = "KEY_8"
+0x104 = "KEY_9"
+
+# funcoes
+0x142 = "KEY_BACKSPACE"
+0x100 = "KEY_PROG2"
+0x143 = "KEY_SETUP"
+0x10f = "KEY_PROG1"
