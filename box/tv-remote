@@ -18,9 +18,11 @@ sempre. Parsear com o formato errado nao da erro, da lixo silencioso.
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import evdev
@@ -29,9 +31,12 @@ NOME_DISPOSITIVO = os.environ.get("TV_REMOTE_INPUT", "gpio_ir_recv")
 HOST = os.environ.get("TV_PLAYER_HOST", "127.0.0.1")
 PORTA = int(os.environ.get("TV_PLAYER_PORT", "5010"))
 CEC = os.environ.get("TV_CEC_DEV", "/dev/cec0")
-# Integracao OPCIONAL com uma interface grafica externa (um app de TV, por
-# exemplo). Vazio = KEY_HOME nao faz nada. Definir no .service:
-#   Environment=TV_UI=/caminho/para/o/app.py
+# Integracao OPCIONAL com uma interface grafica externa. Vazio = KEY_HOME nao
+# faz nada. Aceita duas formas, definidas no .service:
+#   Environment=TV_UI=tv-ui.service        -> systemctl start (preferido)
+#   Environment=TV_UI=/caminho/do/app.py   -> executa direto
+# A unit e melhor: da journal, instancia unica garantida pelo systemd e
+# ExecStopPost, que e o unico jeito de reagir a um kill -9 do app.
 UI = os.environ.get("TV_UI", "")
 
 # Um toque no controle costuma gerar de dois a tres key_down (o NEC repete o
@@ -63,10 +68,19 @@ def log(msg):
     print(msg, flush=True)
 
 
-def falar_com_player(payload):
+# O player segura o lock durante toda a resolucao do link pelo yt-dlp -- ate
+# 180 s, ver "Blocking" no protocolo. Com 4 s o `stop` apertado nesse intervalo
+# estourava e era descartado, e o comando so executava dezenas de segundos
+# depois, matando um video que tinha acabado de comecar.
+TIMEOUT_PLAYER = 190
+
+FILA_CMD = queue.Queue()
+
+
+def falar_com_player(payload, timeout=TIMEOUT_PLAYER):
     """Manda uma linha JSON para o tv-player e devolve a resposta."""
     try:
-        with socket.create_connection((HOST, PORTA), timeout=4) as s:
+        with socket.create_connection((HOST, PORTA), timeout=timeout) as s:
             s.sendall((json.dumps(payload) + "\n").encode())
             resposta = s.makefile().readline()
         return json.loads(resposta or "{}")
@@ -95,14 +109,23 @@ def ui_rodando():
 
 
 def abrir_ui():
-    """Sobe a interface, se ainda nao estiver de pe.
-
-    start_new_session desacopla do systemd deste servico: a interface sobrevive
-    a um restart do tv-remote, e um crash dela nao derruba o controle.
-    """
+    """Sobe a interface configurada em TV_UI (unit systemd ou caminho)."""
     if not UI:
         log("KEY_HOME: nenhuma interface configurada (defina TV_UI)")
         return
+
+    if UI.endswith(".service"):
+        # O systemd cuida de instancia unica, log e do ExecStopPost; um start
+        # numa unit ja ativa e inofensivo.
+        try:
+            subprocess.run(["systemctl", "start", UI], timeout=20,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"interface aberta ({UI})")
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"nao consegui abrir {UI}: {e}")
+        return
+
+    # Caminho direto: aqui a exclusao de instancia e por nossa conta.
     if ui_rodando():
         log("interface ja esta aberta")
         return
@@ -110,6 +133,9 @@ def abrir_ui():
         log(f"interface nao encontrada em {UI}")
         return
     try:
+        # start_new_session desacopla do systemd deste servico: a interface
+        # sobrevive a um restart do tv-remote, e um crash dela nao derruba o
+        # controle.
         with open("/tmp/tv-ui.log", "ab") as saida:
             subprocess.Popen([sys.executable, UI], stdout=saida, stderr=saida,
                              stdin=subprocess.DEVNULL, start_new_session=True)
@@ -153,6 +179,28 @@ def achar_dispositivo():
     return None
 
 
+def trabalhador():
+    """Fala com o player fora da thread que le o controle.
+
+    ⚠️ Antes isto era sincrono no laco de leitura: um comando que caisse durante
+    uma resolucao do yt-dlp bloqueava o proximo aperto de tecla pelo tempo
+    inteiro do timeout. Com a fila, o controle continua respondendo enquanto o
+    player resolve, e os comandos saem na ordem em que foram apertados.
+    """
+    while True:
+        tecla, payload = FILA_CMD.get()
+        try:
+            resposta = falar_com_player(dict(payload))
+            if resposta is not None and resposta.get("erro"):
+                log(f"{tecla} -> {payload['cmd']}: {resposta['erro']}")
+            else:
+                log(f"{tecla} -> {payload['cmd']}")
+            if tecla == "KEY_POWER":
+                desligar_tv_por_cec()
+        finally:
+            FILA_CMD.task_done()
+
+
 def tratar(tecla):
     payload = MAPA.get(tecla)
     if payload is None:
@@ -160,13 +208,7 @@ def tratar(tecla):
     if payload.get("acao") == "abrir_ui":
         abrir_ui()
         return
-    resposta = falar_com_player(dict(payload))
-    if resposta is not None and resposta.get("erro"):
-        log(f"{tecla} -> {payload['cmd']}: {resposta['erro']}")
-    else:
-        log(f"{tecla} -> {payload['cmd']}")
-    if tecla == "KEY_POWER":
-        desligar_tv_por_cec()
+    FILA_CMD.put((tecla, payload))
 
 
 def laco(dev):
@@ -192,6 +234,7 @@ def laco(dev):
 
 
 def main():
+    threading.Thread(target=trabalhador, daemon=True).start()
     while True:
         dev = achar_dispositivo()
         if dev is None:
