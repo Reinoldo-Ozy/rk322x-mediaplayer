@@ -26,6 +26,10 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
 
 PORTA = int(os.environ.get("TV_PLAYER_PORT", "5010"))
+# Mesmo nome que o tv-receiver-audio usa. Estava cravado em hw:2, o que quebra
+# em qualquer unidade onde o HDMI nao seja a terceira placa.
+AUDIO_DEV = os.environ.get("TV_AUDIO_DEV", "hw:2")
+AUDIO_PCM = os.environ.get("TV_AUDIO_PCM", "/dev/snd/pcmC2D0p")
 YTDLP = os.environ.get("YTDLP", "/usr/local/bin/yt-dlp")
 # O YouTube exige resolver um desafio JavaScript antes de entregar as URLs de
 # midia. O runtime padrao do yt-dlp e o Deno, que nao publica binario armv7; o
@@ -55,7 +59,7 @@ def esperar_dispositivos(timeout=6.0):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     fim = time.time() + timeout
     while time.time() < fim:
-        livre = subprocess.run(["fuser", "/dev/snd/pcmC2D0p"],
+        livre = subprocess.run(["fuser", AUDIO_PCM],
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL).returncode != 0
         sem_gst = subprocess.run(["pgrep", "-x", "gst-launch-1.0"],
@@ -65,6 +69,16 @@ def esperar_dispositivos(timeout=6.0):
             return True
         time.sleep(0.3)
     return False
+
+
+def para_gst(texto):
+    """Escapa uma string para ir entre aspas numa descricao de parse_launch.
+
+    A URL vem do yt-dlp, nao do usuario, entao o risco pratico e baixo -- mas uma
+    aspa ou barra invertida no meio quebra a DESCRICAO do pipeline, e o erro que
+    aparece e de sintaxe do GStreamer, que nao aponta para a causa.
+    """
+    return texto.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def resolver(url):
@@ -161,15 +175,15 @@ class Player:
         if info["a"] and not getattr(self, "sem_audio", False):
             demux = ("matroskademux ! opusparse ! opusdec" if info["aext"] == "webm"
                      else "qtdemux ! aacparse ! avdec_aac")
-            aud = (f' souphttpsrc location="{info["a"]}"'
+            aud = (f' souphttpsrc location="{para_gst(info["a"])}"'
                    " ! queue max-size-bytes=4194304 max-size-time=0 max-size-buffers=0"
                    f" ! {demux} ! audioconvert ! audioresample"
                    " ! audio/x-raw,rate=48000,channels=2"
-                   " ! alsasink device=hw:2 sync=true buffer-time=100000")
+                   f" ! alsasink device={AUDIO_DEV} sync=true buffer-time=100000")
 
         if info.get("vivo"):
             # HLS: os segmentos sao MPEG-TS com audio e video juntos.
-            desc = (f'souphttpsrc location="{info["v"]}"'
+            desc = (f'souphttpsrc location="{para_gst(info["v"])}"'
                     # O hlsdemux2 seria mais leve (um thread de download compartilhado
                     # em vez de um souphttpsrc por segmento), mas exige contexto
                     # "streams-aware": fora de urisourcebin/decodebin3 ele falha com
@@ -194,10 +208,10 @@ class Player:
                     # gatilho: alignment-threshold sai dos 40 ms de fabrica (que disparavam
                     # ~37 realinhamentos por segundo — 1580 avisos em 40 s) para 200 ms, e
                     # discont-wait segura 5 s antes de tratar um buraco como descontinuidade.
-                    " ! alsasink device=hw:2 sync=true buffer-time=200000"
+                    f" ! alsasink device={AUDIO_DEV} sync=true buffer-time=200000"
                     " alignment-threshold=200000000 discont-wait=5000000000")
         else:
-            desc = (f'souphttpsrc location="{info["v"]}"'
+            desc = (f'souphttpsrc location="{para_gst(info["v"])}"'
                     " ! queue max-size-bytes=20971520 max-size-time=0 max-size-buffers=0"
                     " ! qtdemux ! h264parse ! v4l2slh264dec"
                     " ! kmssink driver-name=rockchip skip-vsync=true qos=false sync=true"
@@ -368,6 +382,11 @@ PL = Player()
 
 
 def atender(conn):
+    # Sem isto, um cliente que conecta e nao fala nunca solta a thread.
+    try:
+        conn.settimeout(30)
+    except OSError:
+        pass
     try:
         dados = conn.makefile("r").readline()
         req = json.loads(dados or "{}")
