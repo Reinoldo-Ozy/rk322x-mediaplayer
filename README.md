@@ -343,17 +343,70 @@ Needs Armbian with a mainline kernel, GStreamer 1.26 with `v4l2codecs` and `kmss
 
 ## Player protocol (TCP 5010)
 
-One JSON line per command, one JSON line back:
+`tv-player` is the only thing that plays video on this box. Everything else — the web remote, the
+infrared remote, a TV interface — is a client of this protocol. It is documented here, in the
+provider, so a change here is visibly a change to a contract.
 
-```json
-{"cmd":"play","url":"..."}    {"cmd":"add","url":"..."}
-{"cmd":"pause"}  {"cmd":"resume"}  {"cmd":"toggle"}
-{"cmd":"next"}   {"cmd":"prev"}    {"cmd":"stop"}
-{"cmd":"status"}
+**Framing.** One TCP connection carries **one request line and one response line**, then the
+server closes it. Requests and responses are JSON, newline-terminated. There is no session and no
+multiplexing; open a connection per command.
+
+**Commands.**
+
+| Command | Arguments | Does |
+|---|---|---|
+| `play` | `url` (required), `sem_audio` (bool, default false) | Clears the queue and plays. `sem_audio` leaves audio to someone else — used while mirroring |
+| `add` | `url` | Appends to the queue |
+| `pause` / `resume` / `toggle` | — | `toggle` flips whatever the current state is |
+| `seek` | `pos` (seconds, absolute) | ⚠️ Fails on 1080p YouTube: fragmented MP4, `qtdemux` cannot seek |
+| `skip` | `delta` (seconds, relative) | Same limitation as `seek` |
+| `next` / `prev` | — | Moves in the queue |
+| `stop` | — | Stops and **hands the screen back** — see below |
+| `status` | — | Never blocks; safe to poll |
+
+**Responses.** Always an object with `ok` (bool). On failure, `erro` (string). `status` also
+returns `estado` (`parado` / `tocando` / `pausado`), `pos`, `dur`, `titulo`, `idx`, `fila`, and
+`vivo` for live streams. An unknown command answers `{"ok": false, "erro": "comando desconhecido"}`
+rather than closing.
+
+**Blocking.** Any command that starts playback takes as long as `yt-dlp` needs to resolve the link
+— **typically 15 s, up to 180 s** — and holds a lock for that whole time, so other commands queue
+behind it. Give `play` a generous timeout. `status` is deliberately lock-free and answers
+immediately even while a resolution is in flight; poll that instead of guessing.
+
+### Screen handover contract
+
+DRM is exclusive: **one process at a time owns `/dev/dri/card0`**. Three want it — the player, the
+mirroring receiver, and any graphical interface — so the rule has to be explicit.
+
+`tv-player` owns the coordination for its side: it **stops** `tv-receiver` and
+`tv-receiver-audio` when it starts playing, and **starts them again** when playback stops or the
+queue empties. That last part is the piece clients trip over.
+
+A graphical client that draws on this screen must therefore:
+
+```
+1. stop the player and wait for the reply   (it will restart tv-receiver as it stops)
+2. THEN stop tv-receiver                    (before step 1 it just comes back)
+3. wait until nobody holds /dev/dri/card0
+4. open its display
 ```
 
-`status` returns state, position, duration, title, queue index and queue, plus a `vivo` flag for
-live streams.
+and on the way out, release the display **before** telling the player to play, since the player
+takes the device immediately. Reversing steps 1 and 2 produces `kmsdrm not available`, which looks
+like a limitation of the graphics stack and is not.
+
+Two more things a client should do, learned by getting them wrong:
+
+- **Restore `tv-receiver` on every exit path**, including `SIGTERM` and crashes — otherwise
+  mirroring stays broken with no visible cause. But **check `status` first**: starting the
+  receiver while the player is playing makes it fail and, with `Restart=always`, flap for the rest
+  of the video.
+- **Take an exclusive grab (`EVIOCGRAB`) on the infrared device** while holding the screen.
+  `tv-remote` reads the same device and *acts on it*; without the grab, every key you handle in
+  your interface also reaches the player behind you.
+
+`box/tv-web` and `box/tv-remote` are working references for the client side.
 
 ---
 
